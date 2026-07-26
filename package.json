@@ -1,0 +1,24 @@
+{
+  "name": "aca-payment-workflow",
+  "version": "0.1.0",
+  "description": "Sama Educational Co. digital payment request approval workflow",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "bash e2e-test.sh"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "better-sqlite3": "^12.11.1",
+    "exceljs": "^4.4.0",
+    "express": "^5.2.1",
+    "express-session": "^1.19.0",
+    "multer": "^2.2.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
