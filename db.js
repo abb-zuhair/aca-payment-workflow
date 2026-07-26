@@ -88,7 +88,19 @@ CREATE TABLE IF NOT EXISTS group_members (
   }
 })();
 
-// ---- seed admin ----
+/* migration: attachments may live in OneDrive/SharePoint — add drive_id/item_id.
+   Also make `path` nullable-in-practice (cloud attachments have no local path). */
+(function migrateAttachmentsCloud() {
+  const cols = db.prepare(`PRAGMA table_info(attachments)`).all().map(c => c.name);
+  if (!cols.includes('drive_id')) {
+    db.exec(`ALTER TABLE attachments ADD COLUMN drive_id TEXT`);
+    console.log('DB migration: attachments.drive_id added');
+  }
+  if (!cols.includes('item_id')) {
+    db.exec(`ALTER TABLE attachments ADD COLUMN item_id TEXT`);
+    console.log('DB migration: attachments.item_id added');
+  }
+})();
 function seedAdmin() {
   const existing = db.prepare(`SELECT id FROM users WHERE role='admin'`).get();
   if (existing) return null;

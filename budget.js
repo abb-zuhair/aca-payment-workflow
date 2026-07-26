@@ -177,7 +177,7 @@ function computeHeldAmounts() {
   for (const row of rows) {
     let r;
     try { r = JSON.parse(row.json); } catch (e) { continue; }
-    if (r.status === 'rejected') continue;
+    if (r.status === 'rejected' || r.status === 'cancelled') continue;
     if (r.paymentFinalized) continue;
     const budgetApproved = r.approvals && r.approvals.budget && r.approvals.budget.decision === 'approved';
     if (!budgetApproved) continue;

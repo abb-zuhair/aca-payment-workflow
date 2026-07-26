@@ -625,6 +625,7 @@ async function adminOverview() {
   const byStage = k => all.filter(r => r.status === 'pending_' + k).length;
   const approved = all.filter(r => r.status === 'approved');
   const rejected = all.filter(r => r.status === 'rejected');
+  const cancelled = all.filter(r => r.status === 'cancelled');
   const approvedTotal = approved.reduce((s, r) => s + Number(r.amount || 0), 0);
   const pendingTotal = all.filter(r => r.status.startsWith('pending_')).reduce((s, r) => s + Number(r.amount || 0), 0);
   const filters = [
@@ -635,6 +636,7 @@ async function adminOverview() {
     ['pending_finance', 'Awaiting Finance (' + byStage('finance') + ')'],
     ['approved', 'Approved (' + approved.length + ')'],
     ['rejected', 'Rejected (' + rejected.length + ')'],
+    ['cancelled', 'Cancelled (' + cancelled.length + ')'],
   ];
   const shown = state.filter === 'all' ? all : all.filter(r => r.status === state.filter);
   return `
@@ -984,6 +986,37 @@ async function adminBudget() {
         <span id="accessSaved" class="hidden" style="color:var(--green);font-size:13px;font-weight:600;">✓ Saved</span>
       </div>` : '<div class="empty">Add a department first.</div>'}
     </div>
+
+    ${await attachStorePanel()}
+  `;
+}
+async function attachStorePanel() {
+  let data;
+  try { data = await api('/attach-store'); } catch (e) { return ''; }
+  const c = data.config || { mode: 'local' };
+  return `
+    <div class="form-card" style="margin-top:16px;">
+      <h3 class="serif" style="margin:0 0 4px;color:var(--navy-deep);font-size:16px;">Attachment storage</h3>
+      <p style="font-size:13px;color:var(--ink-soft);margin:0 0 14px;">
+        By default, uploaded files (PDFs and images on each request) are stored on the app server. On a hosted
+        setup like Railway that consumes disk. Point this at <b>one shared OneDrive/SharePoint folder</b> and new
+        uploads go there instead — the server keeps only a reference. Files already stored locally keep working.
+      </p>
+      <div class="field radio-set" style="margin-bottom:14px;">
+        <label><input type="radio" name="asmode" value="local" ${c.mode === 'local' ? 'checked' : ''}> Server disk (default)</label>
+        <label><input type="radio" name="asmode" value="onedrive" ${c.mode === 'onedrive' ? 'checked' : ''}> OneDrive / SharePoint folder</label>
+      </div>
+      <div id="asmode_onedrive" style="display:${c.mode === 'onedrive' ? 'block' : 'none'};">
+        ${data.graphConfigured ? '' : `<div class="demo-note" style="margin-bottom:10px;">Needs the Graph env vars + <b>Files.ReadWrite.All</b> (same as the budget workbooks).</div>`}
+        <div class="field"><label>Share link of the attachments folder</label><input id="as_sharelink" value="${esc(c.shareLink || '')}" placeholder="https://...sharepoint.com/:f:/g/... (a FOLDER, not a file)"></div>
+        ${c.folderName ? `<div style="font-size:12.5px;color:var(--green);margin:-8px 0 10px;">✓ Connected folder: <b>${esc(c.folderName)}</b></div>` : ''}
+      </div>
+      <div class="err hidden" id="asErr" style="margin-top:8px;"></div>
+      <div style="display:flex;gap:10px;margin-top:6px;align-items:center;">
+        <button class="btn gold" id="saveAttachStore">Save storage setting</button>
+        <span id="asSaved" class="hidden" style="color:var(--green);font-size:13px;font-weight:600;">✓ Saved</span>
+      </div>
+    </div>
   `;
 }
 async function bindBudget() {
@@ -1043,6 +1076,23 @@ async function bindBudget() {
       const ok = document.getElementById('accessSaved'); ok.classList.remove('hidden'); setTimeout(() => ok.classList.add('hidden'), 2000);
     };
   }
+  // attachment storage
+  document.querySelectorAll('input[name=asmode]').forEach(rd => rd.onchange = () => {
+    document.getElementById('asmode_onedrive').style.display = document.querySelector('input[name=asmode]:checked').value === 'onedrive' ? 'block' : 'none';
+  });
+  const saveAs = document.getElementById('saveAttachStore');
+  if (saveAs) saveAs.onclick = async () => {
+    const errEl = document.getElementById('asErr');
+    const mode = document.querySelector('input[name=asmode]:checked').value;
+    saveAs.disabled = true; saveAs.textContent = 'Saving…';
+    try {
+      await api('/attach-store', { method: 'PUT', body: JSON.stringify({ config: {
+        mode,
+        shareLink: (document.getElementById('as_sharelink') || {}).value || '',
+      } }) });
+      render();
+    } catch (e) { errEl.textContent = e.message; errEl.classList.remove('hidden'); saveAs.disabled = false; saveAs.textContent = 'Save storage setting'; }
+  };
 }
 
 async function adminPrintForm() {
@@ -1060,7 +1110,7 @@ async function adminPrintForm() {
         Without a logo, a colored circle with your initial(s) is used instead.
       </p>
       <div style="display:flex;align-items:center;gap:16px;">
-        <div style="width:64px;height:64px;border-radius:50%;background:#EBD3A0;display:flex;align-items:center;justify-content:center;overflow:hidden;font-family:'Spectral',serif;font-weight:700;font-size:22px;color:#12283D;">
+        <div style="width:64px;height:64px;border-radius:6px;background:#1D4A94;border:2px solid #FFC125;display:flex;align-items:center;justify-content:center;overflow:hidden;font-family:'Spectral',serif;font-weight:700;font-size:22px;color:#fff;">
           ${b.hasLogo ? `<img src="/api/logo?t=${Date.now()}" alt="logo" style="width:100%;height:100%;object-fit:cover;">` : esc(p.logoInitial)}
         </div>
         <div>
@@ -1477,6 +1527,7 @@ function listCards(list) {
       pillText = (blHasBudget(r) && !r.paymentFinalized) ? 'Approved · 🔒 Reserved' : 'Approved';
     }
     else if (r.status === 'rejected') { stripe = 'var(--red)'; pillClass = 'rejected'; pillText = 'Rejected — ' + (r.rejectedStage || ''); }
+    else if (r.status === 'cancelled') { stripe = 'var(--ink-soft)'; pillClass = 'rejected'; pillText = 'Cancelled'; }
     else { const k = currentStageKey(r); pillText = 'Awaiting ' + (k ? stageLabel(k) : ''); }
     const attCount = (r.attachments || []).length;
     return `
@@ -1570,7 +1621,32 @@ async function drawerWrap() {
         ${r.log.map(l => `<div class="c"><b>${esc(l.who)}</b> (${esc(l.role)}) — ${esc(l.action)} <span class="d">· ${fmtDate(l.at)}</span>${l.comment ? '<br><i>“' + esc(l.comment) + '”</i>' : ''}</div>`).join('')}
       </div>` : ''}
       ${actionBox(r)}
+      ${secondaryActions(r)}
     </div>
+  </div>`;
+}
+function secondaryActions(r) {
+  const isPending = r.status && r.status.startsWith('pending_');
+  const isRequester = r.requestorUserId === state.user.id;
+  const isAdmin = state.user.role === 'admin';
+  const canRecall = isPending && !r.paymentFinalized && (isRequester || isAdmin);
+  const canCancel = isAdmin && r.status !== 'rejected' && r.status !== 'cancelled' && !r.paymentFinalized;
+  if (!canRecall && !canCancel) return '';
+  return `
+  <div class="approve-box" style="border-style:dashed;">
+    <h4 style="font-size:13px;">More actions</h4>
+    ${canRecall ? `
+      <p style="font-size:12.5px;color:var(--ink-soft);margin:0 0 8px;">Recalling pulls the request out of the approval queue and returns it to the start — all approvals so far are cleared, and it must go through the chain again.</p>
+      <div class="field" style="margin-bottom:8px;"><input id="recallReason" placeholder="Reason (optional)"></div>
+      <button class="btn outline" id="recallBtn">↺ Recall request</button>
+    ` : ''}
+    ${canCancel ? `
+      <div style="margin-top:${canRecall ? '14px' : '0'};">
+        <p style="font-size:12.5px;color:var(--ink-soft);margin:0 0 8px;">Cancelling stops the request permanently (any budget hold is released). This can't be undone.</p>
+        <div class="field" style="margin-bottom:8px;"><input id="cancelReason" placeholder="Reason (required)"></div>
+        <button class="btn danger" id="cancelReqBtn">✕ Cancel request (admin)</button>
+      </div>
+    ` : ''}
   </div>`;
 }
 function stampsHtml(r) {
@@ -1598,6 +1674,9 @@ function stampsHtml(r) {
   </div>`;
 }
 function actionBox(r) {
+  if (r.status === 'cancelled') {
+    return `<div class="approve-box" style="border-color:var(--ink-soft);"><h4>Cancelled by ${esc(r.cancelledBy || 'admin')}</h4><p style="font-size:13px;color:var(--ink-soft);">${esc(r.cancellationReason || '')}</p></div>`;
+  }
   if (r.status === 'rejected') {
     return `<div class="approve-box"><h4>Rejected at ${esc(r.rejectedStage)} stage</h4><p style="font-size:13px;color:var(--ink-soft);">${esc(r.rejectionReason || '')}</p></div>`;
   }
@@ -1674,9 +1753,10 @@ function actionBox(r) {
     ` : ''}
     <div class="field"><label>Comment (required if rejecting)</label><textarea id="a_comment" rows="2" placeholder="Add a note for the record"></textarea></div>
     <div class="err hidden" id="decisionErr"></div>
-    <div style="display:flex;gap:10px;">
+    <div style="display:flex;gap:10px;flex-wrap:wrap;">
       <button class="btn gold" id="approveBtn">Approve &amp; forward</button>
       <button class="btn danger" id="rejectBtn">Reject</button>
+      <button class="btn outline" id="sendBackBtn" title="Return to the requester and clear all approvals">↩ Send back</button>
       ${cur === 'budget' ? '<button class="btn outline" id="editReqBtn">✎ Edit request</button>' : ''}
     </div>
   </div>`;
@@ -1840,6 +1920,36 @@ function bindDrawer() {
   if (rejectBtn) rejectBtn.onclick = () => handleDecision('rejected');
   const editReqBtn = document.getElementById('editReqBtn');
   if (editReqBtn) editReqBtn.onclick = () => openEditRequest();
+  const sendBackBtn = document.getElementById('sendBackBtn');
+  if (sendBackBtn) sendBackBtn.onclick = async () => {
+    const reason = prompt('Send this request back to the requester for rework. All approvals will be cleared and it restarts the chain.\n\nReason (required):');
+    if (reason === null) return;
+    if (!reason.trim()) { alert('A reason is required to send a request back.'); return; }
+    try {
+      await api('/requests/' + state.openId + '/send-back', { method: 'POST', body: JSON.stringify({ reason: reason.trim() }) });
+      await refreshRequests(); state.tab = 'dashboard'; render();
+    } catch (e) { alert(e.message); }
+  };
+  const recallBtn = document.getElementById('recallBtn');
+  if (recallBtn) recallBtn.onclick = async () => {
+    if (!confirm('Recall this request? All approvals so far will be cleared and it returns to the start of the chain.')) return;
+    recallBtn.disabled = true;
+    try {
+      await api('/requests/' + state.openId + '/recall', { method: 'POST', body: JSON.stringify({ reason: (document.getElementById('recallReason') || {}).value || '' }) });
+      await refreshRequests(); render();
+    } catch (e) { alert(e.message); recallBtn.disabled = false; }
+  };
+  const cancelReqBtn = document.getElementById('cancelReqBtn');
+  if (cancelReqBtn) cancelReqBtn.onclick = async () => {
+    const reason = (document.getElementById('cancelReason') || {}).value.trim();
+    if (!reason) { alert('A reason is required to cancel a request.'); return; }
+    if (!confirm('Cancel this request permanently? This cannot be undone.')) return;
+    cancelReqBtn.disabled = true;
+    try {
+      await api('/requests/' + state.openId + '/cancel', { method: 'POST', body: JSON.stringify({ reason }) });
+      await refreshRequests(); render();
+    } catch (e) { alert(e.message); cancelReqBtn.disabled = false; }
+  };
   if (state.tab === 'print') {
     const printNowBtn = document.getElementById('printNowBtn');
     if (printNowBtn) printNowBtn.onclick = () => window.print();
@@ -1929,7 +2039,7 @@ function printSheet(r, opts) {
   return `
   ${controls}
   <div class="print-sheet">
-    <div class="ph-logo">${cache.branding && cache.branding.hasLogo ? `<img src="/api/logo?t=${Date.now()}" alt="logo" style="height:40px;max-width:120px;object-fit:contain;">` : `<div class="brand-mark" style="background:#C9962C;color:#12283D;">${esc(p.logoInitial)}</div>`}<div><b>${esc(p.orgName)}</b></div></div>
+    <div class="ph-logo">${cache.branding && cache.branding.hasLogo ? `<img src="/api/logo?t=${Date.now()}" alt="logo" style="height:40px;max-width:120px;object-fit:contain;">` : `<div class="brand-mark" style="background:#1D4A94;color:#fff;">${esc(p.logoInitial)}</div>`}<div><b>${esc(p.orgName)}</b></div></div>
     <h2>${esc(p.formTitle)}</h2>
     ${p.headerNote ? `<div style="text-align:center;font-size:11.5px;color:#555;margin:-12px 0 14px;">${esc(p.headerNote)}</div>` : ''}
     ${p.showBanner && r.status === 'approved' ? `

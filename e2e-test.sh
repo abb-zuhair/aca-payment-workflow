@@ -1,6 +1,6 @@
 #!/bin/bash
 set -e
-cd /home/claude/aca-payments
+cd "$(dirname "$0")"
 rm -rf data/payments.db data/payments.db-* data/uploads/* 2>/dev/null || true
 
 ADMIN_PASSWORD='Aca@Admin2026' PORT=3456 node server.js > server.log 2>&1 &
@@ -656,6 +656,98 @@ check "$(echo $R | pyget "print('Budget Supervisor stage' in d.get('error',''))"
 echo "== Signature id recorded on approvals for print rendering =="
 R=$(req admin $B/requests | pyget "print([r for r in d['requests'] if r['id']=='$RIDE'][0]['approvals']['supervisor'].get('byId')==\"$LID\")")
 check "$R" "True" "approval records approver byId (drives signature on printout)"
+
+echo "== Recall: requester pulls back a pending request, approvals cleared, holds released =="
+# fresh request with a budget line so we can watch the hold
+R=$(req zuhair -X POST $B/requests -F department=IT -F payeeName=RecallTest -F 'paymentType=Supplier Payment' -F paymentMethod=Cheque -F amount=80 -F currency=KWD -F description=test -F 'customFieldValues={}' -F budgetDept=$DEPT_IT -F "budgetLines=[{\"deptId\":\"$DEPT_IT\",\"code\":\"ACAH-CON-02\",\"amount\":80}]")
+RIDR=$(echo $R | pyget "print(d['request']['id'])")
+HELD_R_PRE=$(req zuhair "$B/budget/lines?dept=$DEPT_IT" | pyget "print([l['held'] for l in d['lines'] if l['code']=='ACAH-CON-02'][0])")
+# advance to budget stage and approve so a hold exists
+req layla -X POST $B/requests/$RIDR/decision -H 'Content-Type: application/json' -d '{"decision":"approved"}' > /dev/null
+req fatima -X POST $B/requests/$RIDR/decision -H 'Content-Type: application/json' -d '{"decision":"approved"}' > /dev/null
+req ahmed -X POST $B/requests/$RIDR/decision -H 'Content-Type: application/json' -d '{"decision":"approved"}' > /dev/null
+req sara -X POST $B/requests/$RIDR/decision -H 'Content-Type: application/json' -d '{"decision":"approved"}' > /dev/null
+HELD_BEFORE=$(req zuhair "$B/budget/lines?dept=$DEPT_IT" | pyget "print([l['held'] for l in d['lines'] if l['code']=='ACAH-CON-02'][0])")
+python3 -c "assert abs((float('$HELD_BEFORE') - float('$HELD_R_PRE')) - 80) < 0.001, 'hold should rise 80, got %s' % (float('$HELD_BEFORE')-float('$HELD_R_PRE'))"
+check "$?" "0" "hold rose by 80 after budget approval (awaiting finance)"
+# requester recalls
+R=$(req zuhair -X POST $B/requests/$RIDR/recall -H 'Content-Type: application/json' -d '{"reason":"wrong amount"}')
+check "$(echo $R | pyget "print(d['request']['status'])")" "pending_supervisor" "recall returns request to first stage"
+check "$(echo $R | pyget "print(len(d['request']['approvals']))")" "0" "recall cleared all approvals"
+HELD_AFTER=$(req zuhair "$B/budget/lines?dept=$DEPT_IT" | pyget "print([l['held'] for l in d['lines'] if l['code']=='ACAH-CON-02'][0])")
+check "$HELD_AFTER" "$HELD_R_PRE" "budget hold released after recall (back to pre-request level)"
+
+echo "== Recall permissions and guards =="
+CODE=$(req layla -o /dev/null -w '%{http_code}' -X POST $B/requests/$RIDR/recall -H 'Content-Type: application/json' -d '{}')
+check "$CODE" "403" "a non-owner approver cannot recall someone else's request"
+# fully approve then confirm recall is blocked
+req layla -X POST $B/requests/$RIDR/decision -H 'Content-Type: application/json' -d '{"decision":"approved"}' > /dev/null
+req fatima -X POST $B/requests/$RIDR/decision -H 'Content-Type: application/json' -d '{"decision":"approved"}' > /dev/null
+req ahmed -X POST $B/requests/$RIDR/decision -H 'Content-Type: application/json' -d '{"decision":"approved"}' > /dev/null
+req sara -X POST $B/requests/$RIDR/decision -H 'Content-Type: application/json' -d '{"decision":"approved"}' > /dev/null
+req nadia -X POST $B/requests/$RIDR/decision -H 'Content-Type: application/json' -d '{"decision":"approved"}' > /dev/null
+R=$(req zuhair -X POST $B/requests/$RIDR/recall -H 'Content-Type: application/json' -d '{}')
+check "$(echo $R | pyget "print('no longer be recalled' in d.get('error',''))")" "True" "cannot recall a fully approved request"
+
+echo "== Send back: approver bounces a pending request to the start =="
+R=$(req zuhair -X POST $B/requests -F department=IT -F payeeName=SendBackTest -F 'paymentType=Supplier Payment' -F paymentMethod=Cheque -F amount=30 -F currency=KWD -F description=test -F 'customFieldValues={}' -F budgetDept=$DEPT_IT -F "budgetLines=[{\"deptId\":\"$DEPT_IT\",\"code\":\"ACAH-CON-02\",\"amount\":30}]")
+RIDS=$(echo $R | pyget "print(d['request']['id'])")
+req layla -X POST $B/requests/$RIDS/decision -H 'Content-Type: application/json' -d '{"decision":"approved"}' > /dev/null
+# now at accountant stage — Fatima sends it back
+CODE=$(req fatima -o /dev/null -w '%{http_code}' -X POST $B/requests/$RIDS/send-back -H 'Content-Type: application/json' -d '{}')
+check "$CODE" "400" "send-back requires a reason"
+R=$(req fatima -X POST $B/requests/$RIDS/send-back -H 'Content-Type: application/json' -d '{"reason":"needs a quote attached"}')
+check "$(echo $R | pyget "print(d['request']['status'])")" "pending_supervisor" "send-back returns to first stage"
+check "$(echo $R | pyget "print(len(d['request']['approvals']))")" "0" "send-back cleared approvals"
+# an approver NOT at the current stage cannot send back
+req layla -X POST $B/requests/$RIDS/decision -H 'Content-Type: application/json' -d '{"decision":"approved"}' > /dev/null
+CODE=$(req nadia -o /dev/null -w '%{http_code}' -X POST $B/requests/$RIDS/send-back -H 'Content-Type: application/json' -d '{"reason":"x"}')
+check "$CODE" "409" "approver not at the current stage cannot send back"
+
+echo "== Admin cancel: terminal state, holds released, guards =="
+R=$(req zuhair -X POST $B/requests -F department=IT -F payeeName=CancelTest -F 'paymentType=Supplier Payment' -F paymentMethod=Cheque -F amount=60 -F currency=KWD -F description=test -F 'customFieldValues={}' -F budgetDept=$DEPT_IT -F "budgetLines=[{\"deptId\":\"$DEPT_IT\",\"code\":\"ACAH-CON-02\",\"amount\":60}]")
+RIDX=$(echo $R | pyget "print(d['request']['id'])")
+HELD_X_PRE=$(req zuhair "$B/budget/lines?dept=$DEPT_IT" | pyget "print([l['held'] for l in d['lines'] if l['code']=='ACAH-CON-02'][0])")
+req layla -X POST $B/requests/$RIDX/decision -H 'Content-Type: application/json' -d '{"decision":"approved"}' > /dev/null
+req fatima -X POST $B/requests/$RIDX/decision -H 'Content-Type: application/json' -d '{"decision":"approved"}' > /dev/null
+req ahmed -X POST $B/requests/$RIDX/decision -H 'Content-Type: application/json' -d '{"decision":"approved"}' > /dev/null
+req sara -X POST $B/requests/$RIDX/decision -H 'Content-Type: application/json' -d '{"decision":"approved"}' > /dev/null
+HELD_C=$(req zuhair "$B/budget/lines?dept=$DEPT_IT" | pyget "print([l['held'] for l in d['lines'] if l['code']=='ACAH-CON-02'][0])")
+python3 -c "assert abs((float('$HELD_C') - float('$HELD_X_PRE')) - 60) < 0.001"
+check "$?" "0" "hold rose by 60 before cancel"
+CODE=$(req zuhair -o /dev/null -w '%{http_code}' -X POST $B/requests/$RIDX/cancel -H 'Content-Type: application/json' -d '{"reason":"x"}')
+check "$CODE" "403" "non-admin cannot cancel"
+R=$(req admin -X POST $B/requests/$RIDX/cancel -H 'Content-Type: application/json' -d '{}')
+check "$(echo $R | pyget "print('reason is required' in d.get('error',''))")" "True" "cancel requires a reason"
+R=$(req admin -X POST $B/requests/$RIDX/cancel -H 'Content-Type: application/json' -d '{"reason":"duplicate request"}')
+check "$(echo $R | pyget "print(d['request']['status'])")" "cancelled" "admin cancelled the request"
+check "$(echo $R | pyget "print(d['request']['cancelledBy'])")" "admin" "cancelledBy recorded"
+HELD_C2=$(req zuhair "$B/budget/lines?dept=$DEPT_IT" | pyget "print([l['held'] for l in d['lines'] if l['code']=='ACAH-CON-02'][0])")
+check "$HELD_C2" "$HELD_X_PRE" "hold released after cancel (back to pre-request level)"
+R=$(req admin -X POST $B/requests/$RIDX/cancel -H 'Content-Type: application/json' -d '{"reason":"again"}')
+check "$(echo $R | pyget "print('already' in d.get('error',''))")" "True" "cannot cancel an already-cancelled request"
+
+echo "== Attachment storage config =="
+R=$(req admin $B/attach-store)
+check "$(echo $R | pyget "print(d['config']['mode'])")" "local" "attachment store defaults to local"
+R=$(req admin -X PUT $B/attach-store -H 'Content-Type: application/json' -d '{"config":{"mode":"onedrive","shareLink":""}}')
+check "$(echo $R | pyget "print('share link' in d.get('error','').lower() or 'graph env vars' in d.get('error','').lower())")" "True" "onedrive mode blocked without graph config / folder link"
+CODE=$(req zuhair -o /dev/null -w '%{http_code}' $B/attach-store)
+check "$CODE" "403" "non-admin cannot read attachment store config"
+# local mode round-trips fine
+R=$(req admin -X PUT $B/attach-store -H 'Content-Type: application/json' -d '{"config":{"mode":"local"}}')
+check "$(echo $R | pyget "print(d['config']['mode'])")" "local" "can switch attachment store back to local"
+
+echo "== Attachment upload + serve (local mode round-trip) =="
+printf '%%PDF-1.4 test pdf' > /tmp/att_test.pdf
+R=$(req zuhair -X POST $B/requests -F department=IT -F payeeName=AttachTest -F 'paymentType=Supplier Payment' -F paymentMethod=Cheque -F amount=5 -F currency=KWD -F description=test -F 'customFieldValues={}' -F files=@/tmp/att_test.pdf)
+RIDA=$(echo $R | pyget "print(d['request']['id'])")
+ATTID=$(echo $R | pyget "print(d['request']['attachments'][0]['id'])")
+check "$(echo $R | pyget "print(len(d['request']['attachments']))")" "1" "attachment recorded on request"
+CODE=$(req zuhair -o /dev/null -w '%{http_code}' $B/files/$ATTID)
+check "$CODE" "200" "attachment served back to owner"
+CODE=$(req zuhair -o /dev/null -w '%{http_code}' $B/files/nope)
+check "$CODE" "404" "missing attachment 404s"
 
 echo "== Frontend served =="
 CODE=$(curl -s --noproxy '*' -o /dev/null -w '%{http_code}' http://localhost:3456/)

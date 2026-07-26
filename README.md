@@ -6,7 +6,7 @@ with their own logins → completed form prints with an "ALL APPROVALS COMPLETE"
 banner for the final physical signature.
 
 Stack: Node.js + Express + SQLite (better-sqlite3) + vanilla JS frontend.
-No build step. One process. Verified by `e2e-test.sh` (158 automated checks).
+No build step. One process. Verified by `e2e-test.sh` (182 automated checks).
 
 ---
 
@@ -160,6 +160,36 @@ the printed form everywhere at once. Remove it to revert to the letter mark.
 The logo is served from an unauthenticated endpoint (just the image, nothing
 sensitive) so it shows even before anyone logs in.
 
+**Recall, send back, and cancel.** A request in progress isn't stuck:
+- The **requester** (or an admin) can **recall** their own request any time
+  before it's fully approved. Recalling pulls it out of the queue, clears every
+  approval given so far, and returns it to the start of the chain for rework.
+- Any **approver** at the current stage can **send a request back** (a reason
+  is required). This has the same effect — approvals cleared, back to the
+  start — so the requester can fix it and resubmit through the chain.
+- An **admin** can **cancel** a request outright (reason required). Cancelling
+  is a terminal state, shown as "Cancelled" with its own dashboard filter.
+- In every case, any budget hold the request was carrying is released
+  automatically, and nothing is written to a budget sheet. Recall and cancel
+  are both blocked once a payment has been finalized. These actions appear in
+  the request drawer under the approval box, and each is written to the
+  activity log and audit trail.
+
+**Attachment storage on OneDrive/SharePoint.** By default, uploaded files
+(PDFs and images on each request) are stored on the app server's disk — which,
+on a hosted platform like Railway, consumes your volume. Admin → 💰 Budget →
+**Attachment storage** lets you point uploads at **one shared
+OneDrive/SharePoint folder** instead: paste the folder's share link (the same
+Graph app registration and `Files.ReadWrite.All` permission as the budget
+workbooks). From then on, new uploads are streamed straight to that folder via
+Microsoft Graph and only a reference is kept in the database, so the server
+stays lean. Files are named `<request-id>__<index>__<original-name>` so they're
+identifiable in the folder. Files already stored locally keep working — each
+attachment remembers where it lives, so the app serves cloud files from
+OneDrive and older files from disk transparently. If a OneDrive upload ever
+fails at submit time, the file falls back to local storage and the event is
+logged, so an attachment is never lost.
+
 **Multi-department budget integration.** Admin → 💰 Budget lets you register
 **one workbook per department** — IT, HR, Maintenance, and so on — each with
 its own OneDrive link (or a local copy for testing). Every workbook is the
@@ -310,12 +340,13 @@ Finance reconciliation. Requestors cannot access the export.
 server.js        Express app: auth, users, teams, workflow, routing, requests, files, print settings, audit
 db.js            SQLite schema (+ migration), admin seeding, config helpers
 notify.js        Microsoft Graph email notifications
-graph.js         Shared Graph token client
+graph.js         Shared Graph token client (+ file up/download)
 budget.js        Multi-department budget integration (OneDrive + local)
+attachments.js   Attachment storage (OneDrive folder or local disk)
 reset-admin-password.js  Standalone admin password reset (for lockouts)
 public/
   index.html     UI shell + styles
   app.js         Frontend (login, requestor form, approver queues, admin portal, print)
-e2e-test.sh      158-check automated workflow test
+e2e-test.sh      182-check automated workflow test
 data/            Created at runtime: payments.db + uploads/   (mount a volume here)
 ```

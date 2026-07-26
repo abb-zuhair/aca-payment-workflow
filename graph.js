@@ -44,4 +44,58 @@ async function graphFetch(pathOrUrl, opts = {}) {
   return data;
 }
 
-module.exports = { graphConfigured, getGraphToken, graphFetch };
+/* upload raw bytes (PUT file content). Returns the created driveItem JSON.
+   For files up to ~4MB a simple PUT works; larger files use an upload session. */
+async function graphUploadFile(driveId, parentItemId, fileName, buffer, contentType) {
+  const token = await getGraphToken();
+  const safeName = encodeURIComponent(fileName);
+  if (buffer.length <= 4 * 1024 * 1024) {
+    const url = `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${parentItemId}:/${safeName}:/content`;
+    const res = await fetch(url, {
+      method: 'PUT',
+      headers: { Authorization: 'Bearer ' + token, 'Content-Type': contentType || 'application/octet-stream' },
+      body: buffer,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(`Graph upload failed (${res.status}): ${JSON.stringify(data.error || data).slice(0, 300)}`);
+    return data;
+  }
+  /* large file: create an upload session and send in chunks */
+  const sess = await graphFetch(`/drives/${driveId}/items/${parentItemId}:/${safeName}:/createUploadSession`, {
+    method: 'POST',
+    body: JSON.stringify({ item: { '@microsoft.graph.conflictBehavior': 'rename' } }),
+  });
+  const uploadUrl = sess.uploadUrl;
+  const chunkSize = 5 * 1024 * 1024;
+  let start = 0;
+  let last = null;
+  while (start < buffer.length) {
+    const end = Math.min(start + chunkSize, buffer.length);
+    const chunk = buffer.slice(start, end);
+    const res = await fetch(uploadUrl, {
+      method: 'PUT',
+      headers: {
+        'Content-Length': String(chunk.length),
+        'Content-Range': `bytes ${start}-${end - 1}/${buffer.length}`,
+      },
+      body: chunk,
+    });
+    last = await res.json().catch(() => ({}));
+    if (!res.ok && res.status !== 202) throw new Error(`Graph chunk upload failed (${res.status})`);
+    start = end;
+  }
+  return last;
+}
+
+/* download raw bytes of a drive item; returns a Buffer */
+async function graphDownloadFile(driveId, itemId) {
+  const token = await getGraphToken();
+  const res = await fetch(`https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}/content`, {
+    headers: { Authorization: 'Bearer ' + token },
+  });
+  if (!res.ok) throw new Error(`Graph download failed (${res.status})`);
+  const arr = await res.arrayBuffer();
+  return Buffer.from(arr);
+}
+
+module.exports = { graphConfigured, getGraphToken, graphFetch, graphUploadFile, graphDownloadFile };

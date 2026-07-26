@@ -7,23 +7,26 @@
 <link href="https://fonts.googleapis.com/css2?family=Spectral:wght@400;500;600;700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500;600&display=swap" rel="stylesheet">
 <style>
   :root{
-    --navy:#1C3D5A;
-    --navy-deep:#12283D;
-    --teal:#2E6F8E;
-    --gold:#C9962C;
-    --gold-light:#EBD3A0;
-    --paper:#F6F3EC;
-    --paper-dark:#EDE7D8;
+    /* American Creativity Academy — official brand palette
+       navy #1D4A94 · yellow #FFC125 · grey #D9D9D9 · black · white
+       Direction: bold, structured, modern — clean lines, angles, contrast. */
+    --navy:#1D4A94;          /* ACA primary navy */
+    --navy-deep:#143670;     /* darker navy for headers/depth */
+    --teal:#2E63B0;          /* lighter navy for links/focus */
+    --gold:#FFC125;          /* ACA accent yellow */
+    --gold-light:#FFE29A;    /* soft yellow tint */
+    --paper:#F4F4F4;         /* light neutral background */
+    --paper-dark:#E4E4E6;
     --card:#FFFFFF;
-    --ink:#212533;
-    --ink-soft:#666B78;
+    --ink:#1A1A1A;           /* near-black, brand black */
+    --ink-soft:#5C606B;
     --green:#2F7D5A;
     --green-bg:#E7F1EB;
     --red:#B0413E;
     --red-bg:#F8E9E8;
-    --amber-bg:#FBF1DE;
-    --line:#DCD5C3;
-    --radius:10px;
+    --amber-bg:#FFF3D4;      /* yellow wash for "reserved"/highlight states */
+    --line:#D9D9D9;          /* ACA grey hairline */
+    --radius:6px;            /* tighter corners — structured, not rounded */
   }
   *{box-sizing:border-box;}
   body{margin:0;background:var(--paper);color:var(--ink);font-family:'Inter',sans-serif;font-size:14.5px;line-height:1.5;}
@@ -45,17 +48,17 @@
   }
   .brand{display:flex;align-items:center;gap:12px;}
   .brand-mark{
-    width:34px;height:34px;border-radius:50%;
-    background:radial-gradient(circle at 30% 30%, var(--gold-light), var(--gold));
+    width:34px;height:34px;border-radius:6px;
+    background:var(--navy);border:2px solid var(--gold);
     display:flex;align-items:center;justify-content:center;
-    font-family:'Spectral',serif;font-weight:700;color:var(--navy-deep);font-size:16px;
+    font-family:'Spectral',serif;font-weight:700;color:#fff;font-size:16px;
   }
   .brand-text h1{margin:0;font-size:18px;font-weight:600;letter-spacing:.2px;}
   .brand-text span{font-size:11.5px;color:#C9CBD4;letter-spacing:.5px;text-transform:uppercase;}
   .who{display:flex;align-items:center;gap:14px;}
   .who .role-badge{
-    background:var(--gold);color:var(--navy-deep);font-weight:600;
-    padding:4px 12px;border-radius:20px;font-size:12px;letter-spacing:.3px;
+    background:var(--gold);color:var(--navy-deep);font-weight:700;
+    padding:4px 12px;border-radius:4px;font-size:12px;letter-spacing:.3px;
   }
   .who button{
     background:transparent;border:1px solid #4A5C6D;color:#E6E4D8;
@@ -96,8 +99,8 @@
     background:var(--navy);color:#fff;
   }
   .btn:hover{background:var(--navy-deep);}
-  .btn.gold{background:var(--gold);color:var(--navy-deep);}
-  .btn.gold:hover{background:#B98525;}
+  .btn.gold{background:var(--gold);color:var(--navy-deep);font-weight:700;}
+  .btn.gold:hover{background:#E6AC15;}
   .btn.outline{background:transparent;border:1.5px solid var(--navy);color:var(--navy);}
   .btn.outline:hover{background:var(--navy);color:#fff;}
   .btn.danger{background:var(--red);color:#fff;}
@@ -179,7 +182,7 @@
     border:2.5px dashed var(--line);color:var(--ink-soft);background:var(--paper);
   }
   .stamp-node.done .stamp-circle{
-    border-style:solid;border-color:var(--gold);background:var(--amber-bg);color:var(--gold);
+    border-style:solid;border-color:var(--navy);background:var(--amber-bg);color:var(--navy-deep);
     transform:rotate(-6deg);
   }
   .stamp-node.rejected .stamp-circle{
@@ -290,6 +293,7 @@
   .print-sheet{
     background:#fff;border:1px solid var(--line);max-width:820px;margin:0 auto;padding:38px 44px;
     box-shadow:0 10px 30px -18px rgba(0,0,0,.3);
+    font-family:Georgia, 'Times New Roman', serif;
   }
   .print-sheet .ph-logo{display:flex;align-items:center;gap:12px;margin-bottom:6px;}
   .print-sheet h2{text-align:center;font-size:22px;margin:4px 0 18px;letter-spacing:1px;}

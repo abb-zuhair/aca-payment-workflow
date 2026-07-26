@@ -7,6 +7,7 @@ const crypto = require('crypto');
 const { db, DATA_DIR, seedAdmin, getConfig, setConfig, audit, DEFAULT_WORKFLOW, DEFAULT_PRINT, DEFAULT_CUSTOM_FIELDS, STANDARD_PRINT_FIELDS, bcrypt } = require('./db');
 const { notify, isConfigured: mailConfigured, mailFrom } = require('./notify');
 const budget = require('./budget');
+const attachStore = require('./attachments');
 const ExcelJS = require('exceljs');
 
 const app = express();
@@ -447,10 +448,21 @@ app.post('/api/requests', requireRole('requestor', 'admin'), upload.array('files
     if (!chain.length) r.log.push({ who: 'System', role: 'Workflow', action: 'Auto-approved (no stages configured for this amount)', at: now });
 
     saveRequest(r);
-    (req.files || []).forEach((f, i) => {
-      db.prepare(`INSERT INTO attachments (id,request_id,idx,name,type,size,path) VALUES (?,?,?,?,?,?,?)`)
-        .run('att_' + Date.now() + '_' + i, id, i, f.originalname, f.mimetype, f.size, f.path);
-    });
+    let idx = 0;
+    for (const f of (req.files || [])) {
+      let loc;
+      try { loc = await attachStore.persistUpload(f, id, idx); }
+      catch (e) {
+        console.error('Attachment upload failed:', e.message);
+        /* fall back to keeping the local temp file so the attachment isn't lost */
+        loc = { path: f.path, driveId: null, itemId: null };
+        r.log.push({ who: 'System', role: 'Workflow', action: `Attachment "${f.originalname}" could not be sent to OneDrive (${String(e.message).slice(0, 120)}) — kept on the server instead`, at: new Date().toISOString() });
+      }
+      db.prepare(`INSERT INTO attachments (id,request_id,idx,name,type,size,path,drive_id,item_id) VALUES (?,?,?,?,?,?,?,?,?)`)
+        .run('att_' + Date.now() + '_' + idx, id, idx, f.originalname, f.mimetype, f.size, loc.path || '', loc.driveId, loc.itemId);
+      idx++;
+    }
+    saveRequest(r);
     audit(id, me.name, 'Submitted request for ' + r.payeeName + ' — ' + r.currency + ' ' + amt);
     if (chain.length) notify('stage', r, stageRecipients(r, chain[0]), { stage: chain[0] });
     else notify('approved', r, requestorEmail(r).concat(stageRecipients(r, 'accountant')), {});
@@ -660,8 +672,93 @@ app.post('/api/requests/:id/decision', requireRole('supervisor', 'accountant', '
   res.json({ request: r });
 });
 
+/* ---------- recall / send back / cancel ----------
+ * recall (requester) and send-back (approver) both RESET the request to the start
+ * of its chain and clear every approval, per the configured behavior. Any budget
+ * hold releases automatically because holds are computed live from approvals+status.
+ * Admin cancel is a terminal state (like rejected) that stops the request. */
+function resetToStart(r, now) {
+  r.approvals = {};
+  const chain = chainFor(r);
+  r.status = chain.length ? 'pending_' + chain[0] : 'approved';
+  delete r.completedAt;
+  delete r.rejectedStage;
+  delete r.rejectionReason;
+}
+
+app.post('/api/requests/:id/recall', requireAuth, (req, res) => {
+  const r = loadRequest(req.params.id);
+  if (!r) return res.status(404).json({ error: 'Request not found' });
+  const me = req.session.user;
+  if (r.requestorUserId !== me.id && me.role !== 'admin') {
+    return res.status(403).json({ error: 'Only the requester (or an admin) can recall this request' });
+  }
+  if (['approved', 'rejected', 'cancelled'].includes(r.status)) {
+    return res.status(409).json({ error: 'This request can no longer be recalled — it is already ' + r.status });
+  }
+  if (r.paymentFinalized) return res.status(409).json({ error: 'This request has been finalized and cannot be recalled' });
+  const reason = String((req.body || {}).reason || '').trim().slice(0, 500);
+  const now = new Date().toISOString();
+  const hadApprovals = Object.keys(r.approvals || {}).length > 0;
+  resetToStart(r, now);
+  r.log.push({ who: me.name, role: me.role === 'admin' ? 'Admin' : 'Requestor', action: 'Recalled the request — all approvals cleared, returned to the start of the chain' + (hadApprovals ? '' : ' (no approvals had been given yet)'), comment: reason, at: now });
+  saveRequest(r);
+  audit(r.id, me.name, 'Recalled request' + (reason ? ' — "' + reason + '"' : ''));
+  const first = currentStageKey(r);
+  if (first) notify('stage', r, stageRecipients(r, first), { stage: first });
+  r.attachments = attachmentsFor(r.id);
+  res.json({ request: r });
+});
+
+app.post('/api/requests/:id/send-back', requireRole('supervisor', 'accountant', 'budget', 'finance', 'admin'), (req, res) => {
+  const r = loadRequest(req.params.id);
+  if (!r) return res.status(404).json({ error: 'Request not found' });
+  const me = req.session.user;
+  const cur = currentStageKey(r);
+  if (!cur) return res.status(409).json({ error: 'This request is not pending at any stage' });
+  /* the approver acting must be at the current stage (admins may act on any pending stage) */
+  if (me.role !== 'admin') {
+    if (cur !== me.role) return res.status(409).json({ error: 'This request is not at your stage' });
+    if (!canActOn(r, cur, me)) return res.status(403).json({ error: 'This request is assigned to someone else' });
+  }
+  const reason = String((req.body || {}).reason || '').trim().slice(0, 500);
+  if (!reason) return res.status(400).json({ error: 'A reason is required when sending a request back' });
+  const now = new Date().toISOString();
+  resetToStart(r, now);
+  r.log.push({ who: me.name, role: (me.role === 'admin' ? 'Admin' : STAGE_LABELS[cur]), action: 'Sent the request back for rework — all approvals cleared, returned to the start of the chain', comment: reason, at: now });
+  saveRequest(r);
+  audit(r.id, me.name, 'Sent request back — "' + reason + '"');
+  notify('rejected', r, requestorEmail(r), {}); // reuse: notifies requester it needs attention
+  const first = currentStageKey(r);
+  if (first) notify('stage', r, stageRecipients(r, first), { stage: first });
+  r.attachments = attachmentsFor(r.id);
+  res.json({ request: r });
+});
+
+app.post('/api/requests/:id/cancel', requireRole('admin'), (req, res) => {
+  const r = loadRequest(req.params.id);
+  if (!r) return res.status(404).json({ error: 'Request not found' });
+  if (['rejected', 'cancelled'].includes(r.status)) return res.status(409).json({ error: 'This request is already ' + r.status });
+  if (r.paymentFinalized) return res.status(409).json({ error: 'This request has been finalized — the payment has already been recorded, so it cannot be cancelled here' });
+  const reason = String((req.body || {}).reason || '').trim().slice(0, 500);
+  if (!reason) return res.status(400).json({ error: 'A reason is required to cancel a request' });
+  const me = req.session.user;
+  const now = new Date().toISOString();
+  r.status = 'cancelled';
+  r.cancelledBy = me.name;
+  r.cancelledAt = now;
+  r.cancellationReason = reason;
+  delete r.completedAt;
+  r.log.push({ who: me.name, role: 'Admin', action: 'Cancelled the request', comment: reason, at: now });
+  saveRequest(r);
+  audit(r.id, me.name, 'Cancelled request — "' + reason + '"');
+  notify('rejected', r, requestorEmail(r), {});
+  r.attachments = attachmentsFor(r.id);
+  res.json({ request: r });
+});
+
 // ---------- attachments ----------
-app.get('/api/files/:id', requireAuth, (req, res) => {
+app.get('/api/files/:id', requireAuth, async (req, res) => {
   const a = db.prepare(`SELECT * FROM attachments WHERE id=?`).get(req.params.id);
   if (!a) return res.status(404).send('Not found');
   // requestors may only access files on their own requests
@@ -671,10 +768,38 @@ app.get('/api/files/:id', requireAuth, (req, res) => {
       return res.status(403).send('Forbidden');
     }
   }
-  if (!fs.existsSync(a.path)) return res.status(410).send('File no longer available');
-  res.setHeader('Content-Type', a.type);
-  res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(a.name)}"`);
-  fs.createReadStream(a.path).pipe(res);
+  try {
+    await attachStore.serveAttachment(a, res);
+  } catch (e) {
+    if (!res.headersSent) res.status(502).send('Could not retrieve file: ' + e.message);
+  }
+});
+
+// ---------- attachment storage (admin) ----------
+app.get('/api/attach-store', requireRole('admin'), (req, res) => {
+  res.json({ config: attachStore.getAttachStore(), graphConfigured: attachStore.graphConfigured() });
+});
+app.put('/api/attach-store', requireRole('admin'), async (req, res) => {
+  try {
+    const body = req.body.config || {};
+    const cur = attachStore.getAttachStore();
+    const c = Object.assign({}, cur);
+    const mode = body.mode || 'local';
+    if (!['local', 'onedrive'].includes(mode)) return res.status(400).json({ error: 'Invalid mode' });
+    c.mode = mode;
+    if (mode === 'onedrive') {
+      if (!attachStore.graphConfigured()) return res.status(400).json({ error: 'Microsoft Graph env vars are not set (MS_TENANT_ID / MS_CLIENT_ID / MS_CLIENT_SECRET)' });
+      const link = String(body.shareLink || '').trim();
+      if (!link) return res.status(400).json({ error: 'Paste the OneDrive/SharePoint share link of the attachments folder' });
+      if (link !== cur.shareLink || !cur.itemId) {
+        const resolved = await attachStore.resolveFolderLink(link);
+        c.shareLink = link; c.driveId = resolved.driveId; c.itemId = resolved.itemId; c.folderName = resolved.folderName;
+      }
+    }
+    attachStore.setAttachStore(c);
+    audit(null, req.session.user.name, `Attachment storage set to ${c.mode}${c.folderName ? ' (folder: ' + c.folderName + ')' : ''}`);
+    res.json({ config: c });
+  } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
 // ---------- groups / teams (admin) ----------
@@ -1074,6 +1199,7 @@ app.get('/api/export.xlsx', requireRole('admin', 'finance', 'accountant'), async
     const statusText = r =>
       r.status === 'approved' ? 'Approved' :
       r.status === 'rejected' ? 'Rejected' :
+      r.status === 'cancelled' ? 'Cancelled' :
       'Awaiting ' + (STAGE_LABELS[r.status.slice(8)] || r.status);
     const apCell = (r, k) => {
       const ap = r.approvals && r.approvals[k];
@@ -1105,7 +1231,7 @@ app.get('/api/export.xlsx', requireRole('admin', 'finance', 'accountant'), async
         bud: apCell(r, 'budget'),
         fin: apCell(r, 'finance'),
         completed: r.completedAt ? r.completedAt.slice(0, 10) : '',
-        rej: r.status === 'rejected' ? `${r.rejectedStage}: ${r.rejectionReason}` : '',
+        rej: r.status === 'rejected' ? `${r.rejectedStage}: ${r.rejectionReason}` : (r.status === 'cancelled' ? `Cancelled by ${r.cancelledBy}: ${r.cancellationReason}` : ''),
         bline: (budget.budgetLinesOf(r).length ? (budget.budgetLinesOf(r)[0].deptName ? budget.budgetLinesOf(r)[0].deptName + ': ' : '') + budget.budgetLinesOf(r).map(l => `${l.code} (${Number(l.amount).toFixed(3)})`).join(' + ') : ''),
         bfinal: r.paymentFinalized ? `${r.paymentFinalized.by} — ${r.paymentFinalized.at.slice(0, 10)}${r.paymentFinalized.paymentRef ? ' (Ref: ' + r.paymentFinalized.paymentRef + ')' : ''}` : '',
         bsync: r.budgetSync ? (r.budgetSync.status === 'synced' ? 'Synced: ' + ((r.budgetSync.results || []).map(x => x.sheet + ' r' + x.row).join('; ') || 'ok') : r.budgetSync.status + (r.budgetSync.error ? ': ' + r.budgetSync.error.slice(0, 60) : '')) : '',
