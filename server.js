@@ -4,7 +4,7 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
-const { db, DATA_DIR, seedAdmin, getConfig, setConfig, audit, DEFAULT_WORKFLOW, DEFAULT_PRINT, DEFAULT_CUSTOM_FIELDS, STANDARD_PRINT_FIELDS, bcrypt } = require('./db');
+const { db, DATA_DIR, DB_PATH, backupTo, seedAdmin, getConfig, setConfig, audit, DEFAULT_WORKFLOW, DEFAULT_PRINT, DEFAULT_CUSTOM_FIELDS, STANDARD_PRINT_FIELDS, bcrypt } = require('./db');
 const { notify, isConfigured: mailConfigured, mailFrom } = require('./notify');
 const budget = require('./budget');
 const attachStore = require('./attachments');
@@ -1273,6 +1273,26 @@ app.get('/api/mail-status', requireRole('admin'), (req, res) => {
 app.get('/api/audit', requireRole('admin'), (req, res) => {
   const rows = db.prepare(`SELECT * FROM audit_log ORDER BY id DESC LIMIT 500`).all();
   res.json({ audit: rows });
+});
+
+/* admin: download a consistent snapshot of the whole database (.db file).
+   Uses SQLite's backup API so it captures everything including the WAL. */
+app.get('/api/backup.db', requireRole('admin'), async (req, res) => {
+  const tmp = path.join(DATA_DIR, `backup_${Date.now()}.db`);
+  try {
+    await backupTo(tmp);
+    const stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-');
+    audit(null, req.session.user.name, 'Downloaded database backup');
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader('Content-Disposition', `attachment; filename="aca-payments-backup-${stamp}.db"`);
+    const stream = fs.createReadStream(tmp);
+    stream.pipe(res);
+    stream.on('close', () => { try { fs.unlinkSync(tmp); } catch (e) {} });
+    stream.on('error', () => { try { fs.unlinkSync(tmp); } catch (e) {} });
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch (_) {}
+    if (!res.headersSent) res.status(500).json({ error: 'Backup failed: ' + e.message });
+  }
 });
 
 // multer / general error handler

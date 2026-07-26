@@ -316,10 +316,20 @@
     margin-top:22px;border:2px dashed #999;padding:16px;text-align:center;font-size:12px;color:#555;
   }
   @media print{
+    @page{ size: A4 portrait; margin: 12mm; }
     .topbar, .no-print{display:none !important;}
-    body{background:#fff;}
-    .print-sheet{box-shadow:none;border:none;padding:0;}
-    .wrap{padding:0;}
+    html, body{background:#fff;}
+    .wrap{padding:0;margin:0;}
+    /* A4 printable width = 210mm - 12mm margins each side = 186mm.
+       Pin the sheet to that so it fills the page 1:1 (no shrink-to-fit, no overflow). */
+    .print-sheet{
+      box-shadow:none;border:none;padding:0;margin:0;
+      width:186mm;max-width:186mm;
+    }
+    /* make fills (section headers, brand mark, stamps) actually print */
+    *{ -webkit-print-color-adjust:exact; print-color-adjust:exact; }
+    /* keep signature/approval blocks from splitting across pages */
+    .pf-block, .sig-grid, .sig-cell, .final-sig{ break-inside:avoid; page-break-inside:avoid; }
   }
 </style>
 </head>

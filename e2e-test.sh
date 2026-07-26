@@ -749,6 +749,30 @@ check "$CODE" "200" "attachment served back to owner"
 CODE=$(req zuhair -o /dev/null -w '%{http_code}' $B/files/nope)
 check "$CODE" "404" "missing attachment 404s"
 
+echo "== Database backup download (admin only) =="
+CODE=$(req zuhair -o /dev/null -w '%{http_code}' $B/backup.db)
+check "$CODE" "403" "non-admin cannot download the database backup"
+req admin -o /tmp/backup_test.db -w '' $B/backup.db
+# the downloaded file must be a valid SQLite database containing our data
+python3 - <<'PYEOF'
+import sqlite3, os
+assert os.path.getsize('/tmp/backup_test.db') > 0, 'backup file is empty'
+con = sqlite3.connect('/tmp/backup_test.db')
+cur = con.cursor()
+# header check: a real sqlite file starts with "SQLite format 3"
+with open('/tmp/backup_test.db','rb') as f:
+    assert f.read(15) == b'SQLite format 3', 'not a valid sqlite file'
+nusers = cur.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+nreq = cur.execute("SELECT COUNT(*) FROM requests").fetchone()[0]
+assert nusers >= 8, 'backup missing users: %d' % nusers
+assert nreq > 0, 'backup missing requests: %d' % nreq
+con.close()
+print('  backup OK: %d users, %d requests captured' % (nusers, nreq))
+PYEOF
+check "$?" "0" "backup is a valid SQLite file containing users + requests"
+# backup should record itself in the audit log
+check "$(req admin $B/audit | pyget "print(any('Downloaded database backup' in a['action'] for a in d['audit']))")" "True" "backup download is audit-logged"
+
 echo "== Frontend served =="
 CODE=$(curl -s --noproxy '*' -o /dev/null -w '%{http_code}' http://localhost:3456/)
 check "$CODE" "200" "index.html serves"

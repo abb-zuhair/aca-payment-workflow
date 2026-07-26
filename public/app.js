@@ -1370,12 +1370,24 @@ function bindPrintFormEditor() {
 
 async function adminAudit() {
   const { audit } = await api('/audit');
-  if (!audit.length) return `<div class="empty">No audit entries yet.</div>`;
-  return `
-    <table class="admin-table">
-      <tr><th>When (UTC)</th><th>Who</th><th>Request</th><th>Action</th></tr>
-      ${audit.map(a => `<tr><td style="white-space:nowrap;" class="mono">${esc(a.at)}</td><td><b>${esc(a.actor || '—')}</b></td><td class="mono">${esc(a.request_id || '—')}</td><td>${esc(a.action)}</td></tr>`).join('')}
-    </table>`;
+  const backupCard = `
+    <div class="form-card" style="margin-bottom:16px;">
+      <h3 class="serif" style="margin:0 0 4px;color:var(--navy-deep);font-size:16px;">Database backup</h3>
+      <p style="font-size:13px;color:var(--ink-soft);margin:0 0 12px;">
+        Download a complete snapshot of the database — every user, request, approval, setting, and the audit log —
+        as a single <span class="mono">.db</span> file. Keep a copy somewhere safe. To restore it later, place the
+        file on the server's data volume as <span class="mono">payments.db</span> (ask your administrator or see the README).
+        Attachments stored on OneDrive are unaffected by this; locally-stored attachment files are not included in this download.
+      </p>
+      <a class="btn gold" href="/api/backup.db" download style="text-decoration:none;display:inline-block;">⬇ Download database backup</a>
+    </div>`;
+  const table = !audit.length
+    ? `<div class="empty">No audit entries yet.</div>`
+    : `<table class="admin-table">
+        <tr><th>When (UTC)</th><th>Who</th><th>Request</th><th>Action</th></tr>
+        ${audit.map(a => `<tr><td style="white-space:nowrap;" class="mono">${esc(a.at)}</td><td><b>${esc(a.actor || '—')}</b></td><td class="mono">${esc(a.request_id || '—')}</td><td>${esc(a.action)}</td></tr>`).join('')}
+      </table>`;
+  return backupCard + table;
 }
 
 function bindAdmin() {

@@ -6,7 +6,7 @@ with their own logins → completed form prints with an "ALL APPROVALS COMPLETE"
 banner for the final physical signature.
 
 Stack: Node.js + Express + SQLite (better-sqlite3) + vanilla JS frontend.
-No build step. One process. Verified by `e2e-test.sh` (182 automated checks).
+No build step. One process. Verified by `e2e-test.sh` (185 automated checks).
 
 ---
 
@@ -38,6 +38,29 @@ railway run node reset-admin-password.js NewPassword123!
 
 This only touches the admin's password hash — no other data is affected —
 and forces a fresh password to be set on next login.
+
+## Backups (important)
+
+All data — users, requests, approvals, settings, and the audit log — lives in
+one SQLite file, `payments.db`, inside `DATA_DIR`. On Railway that must be a
+mounted **Volume** at the same path as `DATA_DIR` (e.g. `/data`); without a
+Volume, the file is wiped on every deploy. Verify the Volume exists before
+entering real data.
+
+Take backups regularly:
+
+- **In the app:** Admin → 📜 Audit Log → **Download database backup**. This
+  streams a consistent snapshot (`.db` file) you can save anywhere. It uses
+  SQLite's backup API, so it safely includes recent writes held in the WAL.
+- Store copies off the server (your PC, OneDrive, etc.). The download does not
+  include locally-stored attachment files; attachments kept on OneDrive are
+  safe in OneDrive regardless.
+
+To **restore** a backup: stop the app, replace `DATA_DIR/payments.db` with your
+backup file (and remove any `payments.db-wal` / `payments.db-shm` sidecar files
+next to it), then start the app. On Railway, upload the file onto the Volume via
+`railway run` or the Railway shell, then redeploy. Test the restore on a
+throwaway instance first if the data is critical.
 
 Optional: run the automated test suite (starts its own server on port 3456,
 wipes and recreates `./data`):
@@ -347,6 +370,6 @@ reset-admin-password.js  Standalone admin password reset (for lockouts)
 public/
   index.html     UI shell + styles
   app.js         Frontend (login, requestor form, approver queues, admin portal, print)
-e2e-test.sh      182-check automated workflow test
+e2e-test.sh      185-check automated workflow test
 data/            Created at runtime: payments.db + uploads/   (mount a volume here)
 ```

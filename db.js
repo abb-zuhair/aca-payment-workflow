@@ -7,7 +7,8 @@ const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(path.join(DATA_DIR, 'uploads'), { recursive: true });
 
-const db = new Database(path.join(DATA_DIR, 'payments.db'));
+const DB_PATH = path.join(DATA_DIR, 'payments.db');
+const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 
 db.exec(`
@@ -169,4 +170,12 @@ function audit(requestId, actor, action) {
     .run(requestId, actor, action);
 }
 
-module.exports = { db, DATA_DIR, seedAdmin, getConfig, setConfig, audit, DEFAULT_WORKFLOW, DEFAULT_PRINT, DEFAULT_CUSTOM_FIELDS, STANDARD_PRINT_FIELDS, bcrypt };
+/* WAL-safe backup: checkpoint the write-ahead log into the main file, then copy.
+   Using db.backup() writes a consistent single-file snapshot that includes every
+   committed change (a plain file copy could miss data still sitting in the WAL). */
+async function backupTo(destPath) {
+  await db.backup(destPath);
+  return destPath;
+}
+
+module.exports = { db, DATA_DIR, DB_PATH, backupTo, seedAdmin, getConfig, setConfig, audit, DEFAULT_WORKFLOW, DEFAULT_PRINT, DEFAULT_CUSTOM_FIELDS, STANDARD_PRINT_FIELDS, bcrypt };
