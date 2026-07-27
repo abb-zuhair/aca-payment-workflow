@@ -63,14 +63,27 @@ async function render() {
     bindLogin();
     return;
   }
+  // a user with the admin extra can switch between their primary-role view and the admin view
+  const hasAdminExtra = state.user.extraAdmin && state.user.role !== 'admin';
+  if (!state.activeRole || (state.activeRole === 'admin' && !hasAdminExtra)) {
+    state.activeRole = state.user.role;
+  }
+  const activeRole = hasAdminExtra ? state.activeRole : state.user.role;
   const canSign = ['supervisor', 'accountant', 'budget', 'finance'].includes(state.user.role);
   whoBox.innerHTML = `
-    <span class="role-badge">${esc(ROLE_LABELS[state.user.role])}</span>
+    <span class="role-badge">${esc(ROLE_LABELS[activeRole])}</span>
     <span style="font-size:13px;">${esc(state.user.name)}</span>
+    ${hasAdminExtra ? `
+      <select id="roleSwitch" title="Switch view" style="padding:5px 8px;border-radius:5px;border:1px solid var(--line);background:#fff;font-size:12.5px;font-weight:600;color:var(--navy-deep);">
+        <option value="${esc(state.user.role)}" ${activeRole === state.user.role ? 'selected' : ''}>${esc(ROLE_LABELS[state.user.role])} view</option>
+        <option value="admin" ${activeRole === 'admin' ? 'selected' : ''}>Administrator view</option>
+      </select>` : ''}
     ${canSign ? '<button id="sigBtn" title="My signature & stamp">🖋</button>' : ''}
     <button id="pwBtn" title="Change password">🔑</button>
     <button id="logoutBtn">Log out</button>
   `;
+  const roleSwitch = document.getElementById('roleSwitch');
+  if (roleSwitch) roleSwitch.onchange = () => { state.activeRole = roleSwitch.value; state.tab = 'dashboard'; state.adminTab = 'overview'; state.openId = null; render(); };
   document.getElementById('logoutBtn').onclick = async () => { await api('/logout', { method: 'POST' }); state.user = null; render(); };
   document.getElementById('pwBtn').onclick = () => { state.tab = 'password'; state.openId = null; render(); };
   const sigBtn = document.getElementById('sigBtn');
@@ -85,8 +98,8 @@ async function render() {
     bindDrawer();
     return;
   }
-  if (state.user.role === 'requestor') { app.innerHTML = await requestorView(); bindRequestor(); }
-  else if (state.user.role === 'admin') { app.innerHTML = await adminView(); bindAdmin(); }
+  if (activeRole === 'requestor') { app.innerHTML = await requestorView(); bindRequestor(); }
+  else if (activeRole === 'admin') { app.innerHTML = await adminView(); bindAdmin(); }
   else { app.innerHTML = await approverView(); bindApprover(); }
 }
 
@@ -746,6 +759,9 @@ async function adminUsers() {
         <div class="field" style="margin:0;"><label>Initial password (min 8)</label><input id="u_pass" type="text" placeholder="They change it on first login"></div>
         <button class="btn gold" id="addUserBtn" style="height:40px;">Add</button>
       </div>
+      <label style="display:flex;align-items:center;gap:8px;margin-top:12px;font-size:13px;font-weight:600;color:var(--navy);cursor:pointer;">
+        <input type="checkbox" id="u_extraAdmin"> Also grant administrator access (they can switch between their role and the admin view)
+      </label>
       <div class="err hidden" id="userErr" style="margin-top:10px;"></div>
       <div class="demo-note" style="margin-top:12px;">
         Users log in with their name and password. They are forced to set their own password on first login.
@@ -754,7 +770,7 @@ async function adminUsers() {
     </div>
     ${users.length ? `
     <table class="admin-table">
-      <tr><th>Name</th><th>Email</th><th>Role</th><th>Status</th><th style="text-align:right;">Actions</th></tr>
+      <tr><th>Name</th><th>Email</th><th>Role</th><th style="text-align:center;">Admin</th><th>Status</th><th style="text-align:right;">Actions</th></tr>
       ${users.map(u => `
       <tr class="${u.active ? '' : 'user-inactive'}">
         <td><b>${esc(u.name)}</b></td>
@@ -764,6 +780,7 @@ async function adminUsers() {
             ${roleOpts.map(r => `<option value="${r[0]}" ${u.role === r[0] ? 'selected' : ''}>${r[1]}</option>`).join('')}
           </select>
         </td>
+        <td style="text-align:center;" title="Also an administrator"><input type="checkbox" data-admin-for="${u.id}" ${u.extraAdmin ? 'checked' : ''}></td>
         <td><span class="user-badge">${u.active ? 'Active' : 'Deactivated'}</span></td>
         <td style="text-align:right;white-space:nowrap;">
           <button class="mini-btn react" data-resetpw="${u.id}">Reset password</button>
@@ -1424,10 +1441,15 @@ function bindAdmin() {
         email: document.getElementById('u_email').value.trim(),
         role: document.getElementById('u_role').value,
         password: document.getElementById('u_pass').value,
+        extraAdmin: document.getElementById('u_extraAdmin').checked,
       })});
       render();
     } catch (e) { errEl.textContent = e.message; errEl.classList.remove('hidden'); }
   };
+  document.querySelectorAll('[data-admin-for]').forEach(chk => chk.onchange = async () => {
+    try { await api('/users/' + chk.dataset.adminFor, { method: 'PATCH', body: JSON.stringify({ extraAdmin: chk.checked }) }); render(); }
+    catch (e) { alert(e.message); render(); }
+  });
   document.querySelectorAll('[data-toggle]').forEach(b => b.onclick = async () => {
     const u = cache.users.find(x => x.id === b.dataset.toggle);
     try { await api('/users/' + b.dataset.toggle, { method: 'PATCH', body: JSON.stringify({ active: !u.active }) }); render(); }

@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS users (
   email TEXT,
   role TEXT NOT NULL CHECK (role IN ('requestor','supervisor','accountant','budget','finance','admin')),
   active INTEGER NOT NULL DEFAULT 1,
+  extra_admin INTEGER NOT NULL DEFAULT 0,
   password_hash TEXT NOT NULL,
   must_change_password INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -86,6 +87,15 @@ CREATE TABLE IF NOT EXISTS group_members (
       COMMIT;
     `);
     console.log('DB migration: users table now accepts the supervisor role');
+  }
+})();
+
+/* migration: multi-role — users can hold their primary role plus an admin extra */
+(function migrateExtraAdmin() {
+  const cols = db.prepare(`PRAGMA table_info(users)`).all().map(c => c.name);
+  if (!cols.includes('extra_admin')) {
+    db.exec(`ALTER TABLE users ADD COLUMN extra_admin INTEGER NOT NULL DEFAULT 0`);
+    console.log('DB migration: users.extra_admin added');
   }
 })();
 

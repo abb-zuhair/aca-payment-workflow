@@ -44,6 +44,40 @@ echo "== Weak password refused =="
 R=$(req admin -X POST $B/users -H 'Content-Type: application/json' -d '{"name":"Weak","role":"requestor","password":"123"}')
 check "$(echo $R | pyget "print('error' in d)")" "True" "short password refused"
 
+echo "== Multi-role: a Finance Manager can also be granted Admin =="
+R=$(req admin -X POST $B/users -H 'Content-Type: application/json' -d '{"name":"Dana","role":"finance","password":"Test12345","extraAdmin":true}')
+check "$(echo $R | pyget "print(d['user']['role']=='finance' and d['user']['extraAdmin']==True)")" "True" "Dana created as finance + admin extra"
+req dana -X POST $B/login -H 'Content-Type: application/json' -d '{"name":"Dana","password":"Test12345"}' > /dev/null
+req dana -X POST $B/change-password -H 'Content-Type: application/json' -d '{"currentPassword":"Test12345","newPassword":"Test12345"}' > /dev/null 2>&1
+# admin-only endpoint (budget config) must work for the finance+admin user
+CODE=$(req dana -o /dev/null -w '%{http_code}' $B/budget/config)
+check "$CODE" "200" "finance+admin user CAN reach an admin-only endpoint"
+# and the rich user list (admin-capable) is returned to them
+check "$(req dana $B/users | pyget "print(any(u['name']=='admin' for u in d['users']))")" "True" "finance+admin user gets the full admin user list"
+# a plain finance manager must NOT
+req nadia -X POST $B/login -H 'Content-Type: application/json' -d '{"name":"Nadia","password":"Test12345"}' > /dev/null
+req nadia -X POST $B/change-password -H 'Content-Type: application/json' -d '{"currentPassword":"Test12345","newPassword":"Test12345"}' > /dev/null 2>&1
+CODE=$(req nadia -o /dev/null -w '%{http_code}' $B/budget/config)
+check "$CODE" "403" "plain finance manager CANNOT reach the admin-only endpoint"
+
+echo "== Admin extra can be revoked =="
+DANAID=$(req admin $B/users | pyget "print([u['id'] for u in d['users'] if u['name']=='Dana'][0])")
+req admin -X PATCH $B/users/$DANAID -H 'Content-Type: application/json' -d '{"extraAdmin":false}' > /dev/null
+# refresh Dana's session capability via /api/me, then the admin endpoint should now be forbidden
+req dana $B/me > /dev/null
+CODE=$(req dana -o /dev/null -w '%{http_code}' $B/budget/config)
+check "$CODE" "403" "revoking admin extra removes admin access"
+# restore for any later use and confirm re-grant works
+req admin -X PATCH $B/users/$DANAID -H 'Content-Type: application/json' -d '{"extraAdmin":true}' > /dev/null
+req dana $B/me > /dev/null
+CODE=$(req dana -o /dev/null -w '%{http_code}' $B/budget/config)
+check "$CODE" "200" "re-granting admin extra restores access"
+
+echo "== The primary admin account cannot be given a redundant extra flag error path =="
+ADMINID=$(req admin $B/users | pyget "print([u['id'] for u in d['users'] if u['name']=='admin'][0])")
+R=$(req admin -X PATCH $B/users/$ADMINID -H 'Content-Type: application/json' -d '{"extraAdmin":true}')
+check "$(echo $R | pyget "print('error' in d)")" "True" "cannot set extra-admin on the primary admin account"
+
 echo "== Routing: Zuhair -> Layla (supervisor) + Fatima (accountant) =="
 ZID=$(req admin $B/users | pyget "print([u['id'] for u in d['users'] if u['name']=='Zuhair'][0])")
 LID=$(req admin $B/users | pyget "print([u['id'] for u in d['users'] if u['name']=='Layla'][0])")

@@ -126,15 +126,22 @@ function requireAuth(req, res, next) {
   if (!req.session.user) return res.status(401).json({ error: 'Not logged in' });
   next();
 }
+/* a user's effective roles: their primary role, plus 'admin' if they have the admin extra */
+function effectiveRoles(sessionUser) {
+  const roles = [sessionUser.role];
+  if (sessionUser.extraAdmin && sessionUser.role !== 'admin') roles.push('admin');
+  return roles;
+}
 function requireRole(...roles) {
   return (req, res, next) => {
     if (!req.session.user) return res.status(401).json({ error: 'Not logged in' });
-    if (!roles.includes(req.session.user.role)) return res.status(403).json({ error: 'Forbidden' });
+    const mine = effectiveRoles(req.session.user);
+    if (!roles.some(r => mine.includes(r))) return res.status(403).json({ error: 'Forbidden' });
     next();
   };
 }
 function publicUser(u) {
-  return { id: u.id, name: u.name, email: u.email, role: u.role, active: !!u.active, mustChangePassword: !!u.must_change_password };
+  return { id: u.id, name: u.name, email: u.email, role: u.role, extraAdmin: !!u.extra_admin, active: !!u.active, mustChangePassword: !!u.must_change_password };
 }
 function loadRequest(id) {
   const row = db.prepare(`SELECT json FROM requests WHERE id=?`).get(id);
@@ -203,7 +210,7 @@ app.post('/api/login', (req, res) => {
   const u = db.prepare(`SELECT * FROM users WHERE name=?`).get(String(name).trim());
   if (!u || !bcrypt.compareSync(password, u.password_hash)) return res.status(401).json({ error: 'Invalid name or password' });
   if (!u.active) return res.status(403).json({ error: 'This account has been deactivated by the administrator' });
-  req.session.user = { id: u.id, name: u.name, role: u.role };
+  req.session.user = { id: u.id, name: u.name, role: u.role, extraAdmin: !!u.extra_admin };
   audit(null, u.name, 'Logged in');
   res.json({ user: publicUser(u) });
 });
@@ -212,6 +219,9 @@ app.get('/api/me', (req, res) => {
   if (!req.session.user) return res.json({ user: null });
   const u = db.prepare(`SELECT * FROM users WHERE id=?`).get(req.session.user.id);
   if (!u || !u.active) { req.session.destroy(() => {}); return res.json({ user: null }); }
+  // keep session capabilities in sync with the DB (role or admin-extra may have changed)
+  req.session.user.role = u.role;
+  req.session.user.extraAdmin = !!u.extra_admin;
   res.json({ user: publicUser(u) });
 });
 app.post('/api/change-password', requireAuth, (req, res) => {
@@ -226,8 +236,8 @@ app.post('/api/change-password', requireAuth, (req, res) => {
 
 // ---------- users (admin) ----------
 app.get('/api/users', requireAuth, (req, res) => {
-  // non-admins get a slim list (needed nowhere currently, keep admin-only rich list)
-  if (req.session.user.role !== 'admin') {
+  // non-admins get a slim list; admin-capable (primary or extra) get the rich list
+  if (!effectiveRoles(req.session.user).includes('admin')) {
     const users = db.prepare(`SELECT id,name,role,active FROM users WHERE role!='admin'`).all();
     return res.json({ users: users.map(u => ({ id: u.id, name: u.name, role: u.role, active: !!u.active })) });
   }
@@ -235,26 +245,32 @@ app.get('/api/users', requireAuth, (req, res) => {
   res.json({ users: users.map(publicUser) });
 });
 app.post('/api/users', requireRole('admin'), (req, res) => {
-  const { name, email, role, password } = req.body || {};
+  const { name, email, role, password, extraAdmin } = req.body || {};
   if (!name || !role) return res.status(400).json({ error: 'Name and role are required' });
   if (!['requestor', 'supervisor', 'accountant', 'budget', 'finance', 'admin'].includes(role)) return res.status(400).json({ error: 'Invalid role' });
   if (!password || password.length < 8) return res.status(400).json({ error: 'Initial password must be at least 8 characters' });
   const exists = db.prepare(`SELECT id FROM users WHERE name=?`).get(String(name).trim());
   if (exists) return res.status(409).json({ error: 'A user with this name already exists' });
   const id = 'u_' + Date.now() + '_' + crypto.randomBytes(3).toString('hex');
-  db.prepare(`INSERT INTO users (id,name,email,role,active,password_hash,must_change_password) VALUES (?,?,?,?,1,?,1)`)
-    .run(id, String(name).trim(), email || '', role, bcrypt.hashSync(password, 10));
-  audit(null, req.session.user.name, `Added user ${name} (${role})`);
+  const extra = (extraAdmin && role !== 'admin') ? 1 : 0;
+  db.prepare(`INSERT INTO users (id,name,email,role,extra_admin,active,password_hash,must_change_password) VALUES (?,?,?,?,?,1,?,1)`)
+    .run(id, String(name).trim(), email || '', role, extra, bcrypt.hashSync(password, 10));
+  audit(null, req.session.user.name, `Added user ${name} (${role}${extra ? ' + admin' : ''})`);
   res.json({ user: publicUser(db.prepare(`SELECT * FROM users WHERE id=?`).get(id)) });
 });
 app.patch('/api/users/:id', requireRole('admin'), (req, res) => {
   const u = db.prepare(`SELECT * FROM users WHERE id=?`).get(req.params.id);
   if (!u) return res.status(404).json({ error: 'User not found' });
-  const { role, active, resetPassword } = req.body || {};
+  const { role, active, resetPassword, extraAdmin } = req.body || {};
   if (role !== undefined) {
     if (u.role === 'admin') return res.status(400).json({ error: "Cannot change the admin's role" });
     db.prepare(`UPDATE users SET role=? WHERE id=?`).run(role, u.id);
     audit(null, req.session.user.name, `Changed ${u.name} role to ${role}`);
+  }
+  if (extraAdmin !== undefined) {
+    if (u.role === 'admin') return res.status(400).json({ error: 'The primary administrator already has full admin rights' });
+    db.prepare(`UPDATE users SET extra_admin=? WHERE id=?`).run(extraAdmin ? 1 : 0, u.id);
+    audit(null, req.session.user.name, `${extraAdmin ? 'Granted' : 'Removed'} admin rights ${extraAdmin ? 'to' : 'from'} ${u.name}`);
   }
   if (active !== undefined) {
     if (u.role === 'admin') return res.status(400).json({ error: 'Cannot deactivate the admin account' });
@@ -309,7 +325,7 @@ app.put('/api/routing', requireRole('admin'), (req, res) => {
 app.get('/api/requests', requireAuth, (req, res) => {
   const me = req.session.user;
   let rows;
-  if (me.role === 'requestor') {
+  if (me.role === 'requestor' && !me.extraAdmin) {
     rows = db.prepare(`SELECT json FROM requests WHERE requestor_id=? OR requestor_name=? ORDER BY created_at DESC`).all(me.id, me.name);
   } else {
     rows = db.prepare(`SELECT json FROM requests ORDER BY created_at DESC`).all();
