@@ -30,6 +30,14 @@ function blOf(r) {
   return [];
 }
 function blHasBudget(r) { return blOf(r).length > 0; }
+/* format an Adjustments (Transfer ±) value with sign + color; blank/zero shows a dash */
+function adjustCell(v) {
+  const n = Number(v || 0);
+  if (!n) return '—';
+  const txt = (n > 0 ? '+' : '−') + Math.abs(n).toLocaleString(undefined, { minimumFractionDigits: 3 });
+  const color = n > 0 ? 'var(--green)' : 'var(--red)';
+  return `<span style="color:${color};font-weight:600;">${txt}</span>`;
+}
 
 async function refreshRequests() { cache.requests = (await api('/requests')).requests; }
 
@@ -522,26 +530,33 @@ async function approverView() {
   const toFinalize = all.filter(r => r.status === 'approved' && blHasBudget(r) && !r.paymentFinalized);
   const isAccountant = state.user.role === 'accountant';
   const isBudget = state.user.role === 'budget';
+  const isFinance = state.user.role === 'finance';
+  const canSeeBudget = isBudget || isFinance;
+  const allRequests = all.slice().sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
   return `
     <div class="page-head">
       <div><h2>${label} Queue</h2><p>Requests waiting on your review, and ones you've already actioned.</p></div>
       ${(state.user.role === 'accountant' || state.user.role === 'finance') ? `<a class="btn outline" href="/api/export.xlsx" style="text-decoration:none;">📥 Export to Excel</a>` : ''}
     </div>
     <div class="tabs">
-      <div class="tab ${state.tab !== 'reviewed' && state.tab !== 'print_ready' && state.tab !== 'finalize_queue' && state.tab !== 'budget_view' ? 'active' : ''}" data-tab="pending">Pending your approval (${pending.length})</div>
+      <div class="tab ${state.tab !== 'reviewed' && state.tab !== 'print_ready' && state.tab !== 'finalize_queue' && state.tab !== 'budget_view' && state.tab !== 'tracking' ? 'active' : ''}" data-tab="pending">Pending your approval (${pending.length})</div>
       <div class="tab ${state.tab === 'reviewed' ? 'active' : ''}" data-tab="reviewed">Already reviewed by you (${reviewed.length})</div>
+      ${isFinance ? `<div class="tab ${state.tab === 'tracking' ? 'active' : ''}" data-tab="tracking">📊 Track Requests (${allRequests.length})</div>` : ''}
       ${isAccountant ? `<div class="tab ${state.tab === 'print_ready' ? 'active' : ''}" data-tab="print_ready">🖨 Ready to print (${approvedAll.length})</div>` : ''}
       ${isAccountant ? `<div class="tab ${state.tab === 'finalize_queue' ? 'active' : ''}" data-tab="finalize_queue">💳 Finalize Payment (${toFinalize.length})</div>` : ''}
-      ${isBudget ? `<div class="tab ${state.tab === 'budget_view' ? 'active' : ''}" data-tab="budget_view">💰 Budget</div>` : ''}
+      ${canSeeBudget ? `<div class="tab ${state.tab === 'budget_view' ? 'active' : ''}" data-tab="budget_view">💰 Budget</div>` : ''}
     </div>
     ${state.tab === 'reviewed' ? listCards(reviewed)
+      : state.tab === 'tracking' && isFinance ? `
+        <p style="font-size:13px;color:var(--ink-soft);margin:-6px 0 14px;">Every request in the system, newest first — for oversight. You can open any request to see its full history.</p>
+        ${listCards(allRequests)}`
       : state.tab === 'print_ready' && isAccountant ? `
         <p style="font-size:13px;color:var(--ink-soft);margin:-6px 0 14px;">Fully approved requests — open one and use <b>Print Form</b> to produce the completed form for the final physical signature and filing.</p>
         ${listCards(approvedAll)}`
       : state.tab === 'finalize_queue' && isAccountant ? `
         <p style="font-size:13px;color:var(--ink-soft);margin:-6px 0 14px;">Fully approved, budget-linked requests still <b>reserved but not deducted</b>. Open one and finalize the payment once it's actually issued — that's what writes the PRQ into the budget tracking sheet.</p>
         ${listCards(toFinalize)}`
-      : state.tab === 'budget_view' && isBudget ? `<div id="budgetViewMount"><div class="empty">Loading budget lines…</div></div>`
+      : state.tab === 'budget_view' && canSeeBudget ? `<div id="budgetViewMount"><div class="empty">Loading budget lines…</div></div>`
       : `${listCards(pending)}
          ${others.length ? `<p style="font-size:12.5px;color:var(--ink-soft);margin-top:14px;">${others.length} other request${others.length > 1 ? 's' : ''} at the ${label} stage ${others.length > 1 ? 'are' : 'is'} assigned to a different ${label.toLowerCase()} and won't appear in your queue.</p>` : ''}`
     }
@@ -549,7 +564,7 @@ async function approverView() {
 }
 function bindApprover() {
   document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
-    state.tab = ['reviewed', 'print_ready', 'finalize_queue', 'budget_view'].includes(t.dataset.tab) ? t.dataset.tab : 'dashboard';
+    state.tab = ['reviewed', 'print_ready', 'finalize_queue', 'budget_view', 'tracking'].includes(t.dataset.tab) ? t.dataset.tab : 'dashboard';
     render();
   });
   bindCardOpens();
@@ -569,13 +584,14 @@ async function mountBudgetTable(mountId) {
     const rows = cache._budgetLines.filter(l => !q || l.code.toLowerCase().includes(q) || (l.description || '').toLowerCase().includes(q) || (l.deptName || '').toLowerCase().includes(q) || (l.trackerSheet || '').toLowerCase().includes(q));
     document.getElementById('budgetTableWrap').innerHTML = `
       <table class="admin-table">
-        <tr><th>Dept</th><th>Code</th><th>Description</th><th style="text-align:right;">Budget</th><th style="text-align:right;">Utilized</th><th style="text-align:right;">Held</th><th style="text-align:right;">Available</th></tr>
+        <tr><th>Dept</th><th>Code</th><th>Description</th><th style="text-align:right;">Budget</th><th style="text-align:right;">Adjustments (Transfer ±)</th><th style="text-align:right;">Utilized</th><th style="text-align:right;">Held</th><th style="text-align:right;">Available</th></tr>
         ${rows.map(l => `
         <tr>
           <td style="font-size:12px;color:var(--ink-soft);">${esc(l.deptName || '')}</td>
           <td class="mono"><b>${esc(l.code)}</b></td>
           <td>${esc(l.description)}</td>
           <td style="text-align:right;" class="mono">${l.budget.toLocaleString(undefined, { minimumFractionDigits: 3 })}</td>
+          <td style="text-align:right;" class="mono">${adjustCell(l.adjust)}</td>
           <td style="text-align:right;" class="mono">${l.utilized.toLocaleString(undefined, { minimumFractionDigits: 3 })}</td>
           <td style="text-align:right;" class="mono">${l.held ? l.held.toLocaleString(undefined, { minimumFractionDigits: 3 }) : '—'}</td>
           <td style="text-align:right;" class="mono" ${l.available <= 0 ? 'style="text-align:right;color:var(--red);font-weight:700;"' : ''}>${l.available.toLocaleString(undefined, { minimumFractionDigits: 3 })}</td>
@@ -936,10 +952,11 @@ async function adminBudget() {
         ${Array.isArray(lines) && lines.length ? `
         <details style="margin-top:8px;"><summary style="cursor:pointer;font-size:13px;color:var(--navy);">View ${lines.length} budget lines</summary>
         <table class="admin-table" style="margin-top:8px;">
-          <tr><th>Code</th><th>Description</th><th style="text-align:right;">Budget</th><th style="text-align:right;">Utilized</th><th style="text-align:right;">Held</th><th style="text-align:right;">Available</th></tr>
+          <tr><th>Code</th><th>Description</th><th style="text-align:right;">Budget</th><th style="text-align:right;">Adjustments (Transfer ±)</th><th style="text-align:right;">Utilized</th><th style="text-align:right;">Held</th><th style="text-align:right;">Available</th></tr>
           ${lines.map(l => `<tr>
             <td class="mono"><b>${esc(l.code)}</b></td><td>${esc(l.description)}</td>
             <td style="text-align:right;" class="mono">${l.budget.toLocaleString(undefined, { minimumFractionDigits: 3 })}</td>
+            <td style="text-align:right;" class="mono">${adjustCell(l.adjust)}</td>
             <td style="text-align:right;" class="mono">${l.utilized.toLocaleString(undefined, { minimumFractionDigits: 3 })}</td>
             <td style="text-align:right;" class="mono">${l.held ? l.held.toLocaleString(undefined, { minimumFractionDigits: 3 }) : '—'}</td>
             <td style="text-align:right;" class="mono" ${l.available <= 0 ? 'style="text-align:right;color:var(--red);font-weight:700;"' : ''}>${l.available.toLocaleString(undefined, { minimumFractionDigits: 3 })}</td>
@@ -2040,14 +2057,46 @@ function printSheet(r, opts) {
     <div style="font-size:12.5px;color:var(--ink-soft);margin:4px 0 8px;">Browsers can't merge PDF attachments into this printout. Open each one and print it after the form — image attachments below are already included.</div>
     ${pdfAtts.map(a => `<a class="btn outline" style="padding:6px 12px;font-size:12px;text-decoration:none;margin-right:8px;" href="/api/files/${a.id}" target="_blank">📄 ${esc(a.name)}</a>`).join('')}
   </div>` : ''}`;
-  const fieldRows = layout.filter(b => b.visible).map(b => {
-    if (b.kind === 'header') return `<div class="pf-section-title">${esc(b.label)}</div>`;
+  /* Build compact two-column rows: pair consecutive value fields left/right so the
+     form fits on one A4 page. Section headers always break to full width, and
+     naturally-long fields (description, address, static notes) stay full width. */
+  const fullWidthKeys = ['description', 'payeeAddress', 'requestorAddress'];
+  const cellHtml = (b) => {
     let value;
     if (b.kind === 'static') value = esc(b.staticText || '');
     else if (b.kind === 'custom') value = customFieldPrintValue(r, b.sourceKey);
     else value = STD_PRINT_ACCESSORS[b.sourceKey] ? STD_PRINT_ACCESSORS[b.sourceKey](r) : '—';
-    return `<div class="pf-row"><div class="pf-cell"><span class="pf-label">${esc(b.label)}</span>${value}</div></div>`;
-  }).join('');
+    return `<span class="pf-label">${esc(b.label)}</span>${value}`;
+  };
+  const isFullWidth = (b) => b.kind === 'static' || fullWidthKeys.includes(b.sourceKey);
+  const visibleBlocks = layout.filter(b => b.visible);
+  let fieldRows = '';
+  let pending = null; // a value-cell waiting for a right-hand partner
+  const flushPending = () => {
+    if (pending) {
+      fieldRows += `<div class="pf-row pf-two"><div class="pf-cell">${pending}</div><div class="pf-cell"></div></div>`;
+      pending = null;
+    }
+  };
+  for (const b of visibleBlocks) {
+    if (b.kind === 'header') {
+      flushPending();
+      fieldRows += `<div class="pf-section-title">${esc(b.label)}</div>`;
+      continue;
+    }
+    if (isFullWidth(b)) {
+      flushPending();
+      fieldRows += `<div class="pf-row"><div class="pf-cell">${cellHtml(b)}</div></div>`;
+      continue;
+    }
+    if (pending === null) {
+      pending = cellHtml(b); // hold for a partner
+    } else {
+      fieldRows += `<div class="pf-row pf-two"><div class="pf-cell">${pending}</div><div class="pf-cell">${cellHtml(b)}</div></div>`;
+      pending = null;
+    }
+  }
+  flushPending();
   return `
   ${controls}
   <div class="print-sheet">

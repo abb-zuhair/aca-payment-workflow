@@ -614,8 +614,19 @@ req ahmed -X POST $B/login -H 'Content-Type: application/json' -d '{"name":"Ahme
 R=$(req ahmed $B/budget/lines)
 check "$(echo $R | pyget "print(len(d['lines']) > 0)")" "True" "budget supervisor can read budget lines"
 check "$(echo $R | pyget "print(any(l.get('deptName')=='IT' for l in d['lines']))")" "True" "lines carry department name for the supervisor view"
+check "$(echo $R | pyget "print(all('adjust' in l for l in d['lines']))")" "True" "every budget line exposes the Adjustments (Transfer ±) value"
 CODE=$(req ahmed -o /dev/null -w '%{http_code}' $B/budget/config)
 check "$CODE" "403" "budget supervisor cannot read admin budget CONFIG"
+
+echo "== Finance Manager can view budget lines and all requests (tracking) =="
+req nadia -X POST $B/login -H 'Content-Type: application/json' -d '{"name":"Nadia","password":"Test12345"}' > /dev/null
+R=$(req nadia $B/budget/lines)
+check "$(echo $R | pyget "print(len(d['lines']) > 0)")" "True" "finance manager can read budget lines"
+check "$(echo $R | pyget "print(all('adjust' in l for l in d['lines']))")" "True" "finance sees the adjust value on lines"
+R=$(req nadia $B/requests)
+check "$(echo $R | pyget "print(len(d['requests']) > 0)")" "True" "finance manager sees all requests (tracking)"
+CODE=$(req nadia -o /dev/null -w '%{http_code}' $B/budget/config)
+check "$CODE" "403" "finance manager cannot read admin budget CONFIG"
 
 echo "== Budget Supervisor edits a request before approving =="
 R=$(req zuhair -X POST $B/requests -F department=IT -F payeeName=BeforeEdit -F 'paymentType=Supplier Payment' -F paymentMethod=Cheque -F amount=100 -F currency=KWD -F 'description=original desc' -F 'customFieldValues={}' -F budgetDept=$DEPT_IT -F "budgetLines=[{\"deptId\":\"$DEPT_IT\",\"code\":\"ACAH-CON-02\",\"amount\":100}]")

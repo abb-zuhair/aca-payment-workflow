@@ -325,11 +325,24 @@
     .print-sheet{
       box-shadow:none;border:none;padding:0;margin:0;
       width:186mm;max-width:186mm;
+      font-size:11px;
     }
+    /* compaction so a normal request fits on a single page */
+    .print-sheet .ph-logo{margin-bottom:2px;}
+    .print-sheet h2{font-size:17px;margin:2px 0 8px;}
+    .pf-cell{padding:4px 10px;font-size:11px;}
+    .pf-label{font-size:9px;margin-bottom:1px;}
+    .pf-section-title{font-size:10.5px;padding:3px 10px;}
+    .sig-cell{padding:8px 10px;font-size:10.5px;}
+    .sig-line{margin-top:14px;}
+    .sig-marks{height:38px;}
+    .final-sig{margin-top:12px;padding:10px;font-size:10.5px;}
     /* make fills (section headers, brand mark, stamps) actually print */
     *{ -webkit-print-color-adjust:exact; print-color-adjust:exact; }
     /* keep signature/approval blocks from splitting across pages */
     .pf-block, .sig-grid, .sig-cell, .final-sig{ break-inside:avoid; page-break-inside:avoid; }
+    /* image attachments always start on their own page, never crowd the form */
+    .print-attachment{ break-before:page; page-break-before:always; }
   }
 </style>
 </head>
