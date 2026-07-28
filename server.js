@@ -882,7 +882,7 @@ app.put('/api/budget/config', requireRole('admin'), (req, res) => {
   const c = Object.assign({}, cur);
   if (body.policy !== undefined) { if (!['block', 'warn'].includes(body.policy)) return res.status(400).json({ error: 'Invalid policy' }); c.policy = body.policy; }
   if (body.required !== undefined) c.required = !!body.required;
-  if (body.cacheMinutes !== undefined) c.cacheMinutes = Math.max(1, Number(body.cacheMinutes) || 5);
+  if (body.cacheMinutes !== undefined) { const n = Number(body.cacheMinutes); c.cacheMinutes = isFinite(n) ? Math.min(1440, Math.max(1, Math.round(n))) : 5; }
   budget.setBudgetConfig(c);
   audit(null, req.session.user.name, 'Budget global settings updated (policy: ' + c.policy + ', required: ' + c.required + ')');
   res.json({ config: c });
@@ -946,10 +946,10 @@ app.get('/api/budget/lines', requireAuth, async (req, res) => {
       const allowed = budget.departmentsForUser(req.session.user.id, false).some(d => d.id === req.query.dept);
       if (!allowed) return res.status(403).json({ error: 'No access to that department' });
       const data = await budget.getDeptLines(req.query.dept, req.query.force === '1');
-      return res.json({ required: cfg.required, policy: cfg.policy, lines: data.lines });
+      return res.json({ required: cfg.required, policy: cfg.policy, lines: data.lines, stale: data.stale ? [{ dept: data.deptName, cachedAt: data.cachedAt }] : [] });
     }
     const data = await budget.getBudgetLinesForUser(req.session.user.id, req.query.force === '1');
-    res.json({ required: cfg.required, policy: cfg.policy, lines: data.lines, errors: data.errors, departments: data.departments });
+    res.json({ required: cfg.required, policy: cfg.policy, lines: data.lines, errors: data.errors, stale: data.stale, departments: data.departments });
   } catch (e) {
     res.status(502).json({ error: 'Could not read budget workbook: ' + e.message });
   }

@@ -454,6 +454,14 @@ echo "== Budget: register IT department (local copy of the real tracking sheet) 
 cp "$(dirname "$0")/samples/sample-budget-workbook.xlsx" /tmp/budget_it.xlsx
 cp "$(dirname "$0")/samples/sample-budget-workbook.xlsx" /tmp/budget_hr.xlsx
 req admin -X PUT $B/budget/config -H 'Content-Type: application/json' -d '{"config":{"policy":"block","required":true}}' > /dev/null
+
+echo "== Budget cache duration is configurable =="
+R=$(req admin -X PUT $B/budget/config -H 'Content-Type: application/json' -d '{"config":{"cacheMinutes":45}}')
+check "$(echo $R | pyget "print(d['config']['cacheMinutes'])")" "45" "cacheMinutes saved (45)"
+R=$(req admin -X PUT $B/budget/config -H 'Content-Type: application/json' -d '{"config":{"cacheMinutes":0}}')
+check "$(echo $R | pyget "print(d['config']['cacheMinutes'])")" "1" "cacheMinutes floored to >=1"
+# leave a sane cache for the rest of the suite
+req admin -X PUT $B/budget/config -H 'Content-Type: application/json' -d '{"config":{"cacheMinutes":5}}' > /dev/null
 R=$(req admin -X POST $B/budget/departments -H 'Content-Type: application/json' -d '{"name":"IT","mode":"local","localPath":"/tmp/budget_it.xlsx"}')
 check "$(echo $R | pyget "print(any(x['name']=='IT' for x in d['config']['departments']))")" "True" "IT department added"
 DEPT_IT=$(echo $R | pyget "print([x['id'] for x in d['config']['departments'] if x['name']=='IT'][0])")
@@ -817,6 +825,11 @@ PYEOF
 check "$?" "0" "backup is a valid SQLite file containing users + requests"
 # backup should record itself in the audit log
 check "$(req admin $B/audit | pyget "print(any('Downloaded database backup' in a['action'] for a in d['audit']))")" "True" "backup download is audit-logged"
+
+echo "== Budget stale-cache fallback (workbook briefly unreadable) =="
+node "$(dirname "$0")/test-stale-cache.js" > /tmp/stale_out.log 2>&1
+check "$?" "0" "failed live read serves last-known-good data instead of erroring"
+cat /tmp/stale_out.log | sed 's/^/  /'
 
 echo "== Frontend served =="
 CODE=$(curl -s --noproxy '*' -o /dev/null -w '%{http_code}' http://localhost:3456/)

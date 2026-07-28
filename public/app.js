@@ -592,6 +592,12 @@ async function mountBudgetTable(mountId) {
   try { info = await api('/budget/lines'); } catch (e) { mount.innerHTML = `<div class="err">Could not load budget lines: ${esc(e.message)}</div>`; return; }
   if (!info.lines || !info.lines.length) { mount.innerHTML = '<div class="empty">No budget lines available' + (info.errors && info.errors.length ? ': ' + esc(info.errors.map(x => x.dept + ' — ' + x.error).join('; ')) : '.') + '</div>'; return; }
   cache._budgetLines = info.lines;
+  const staleBanner = (info.stale && info.stale.length) ? `
+    <div style="background:var(--amber-bg);border:1px solid var(--gold);border-radius:6px;padding:8px 12px;margin-bottom:12px;font-size:12.5px;color:var(--navy-deep);">
+      ⚠ Showing the last saved budget figures — couldn't refresh from ${esc(info.stale.map(s => s.dept).join(', '))} just now
+      ${info.stale[0].cachedAt ? '(as of ' + new Date(info.stale[0].cachedAt).toLocaleTimeString() + ')' : ''}.
+      This usually means the workbook is open for editing. It'll refresh automatically once it's available.
+    </div>` : '';
   const draw = (filter) => {
     const q = (filter || '').toLowerCase().trim();
     const rows = cache._budgetLines.filter(l => !q || l.code.toLowerCase().includes(q) || (l.description || '').toLowerCase().includes(q) || (l.deptName || '').toLowerCase().includes(q) || (l.trackerSheet || '').toLowerCase().includes(q));
@@ -613,6 +619,7 @@ async function mountBudgetTable(mountId) {
       ${rows.length ? '' : '<div class="empty">No lines match your search.</div>'}`;
   };
   mount.innerHTML = `
+    ${staleBanner}
     <div class="field" style="max-width:420px;margin-bottom:12px;"><input id="budgetSearch" placeholder="🔍 Search by department, code or description…"></div>
     <div id="budgetTableWrap"></div>`;
   document.getElementById('budgetSearch').oninput = e => draw(e.target.value);
@@ -950,6 +957,10 @@ async function adminBudget() {
           </select>
         </div>
         <div class="field"><label class="sw" style="display:flex;align-items:center;gap:8px;margin-top:26px;font-weight:600;font-size:13px;color:var(--navy);"><input type="checkbox" id="b_required" ${config.required ? 'checked' : ''}> Budget line mandatory on every request</label></div>
+        <div class="field"><label>Cache budget data for (minutes)</label>
+          <input id="b_cache" type="number" min="1" max="1440" value="${Number(config.cacheMinutes || 5)}" style="width:100%;padding:9px;border:1px solid var(--line);border-radius:7px;background:#FCFBF7;">
+          <span style="font-size:11.5px;color:var(--ink-soft);">How long to reuse fetched budget figures before reading the live workbook again. Higher = faster Budget tab and fewer clashes when someone has the Excel file open; lower = fresher numbers. 30–60 is a good balance.</span>
+        </div>
       </div>
       <button class="btn outline" id="saveBudgetGlobal" style="margin-bottom:6px;">Save settings</button>
       <span id="bGlobalSaved" class="hidden" style="color:var(--green);font-size:13px;font-weight:600;margin-left:8px;">✓ Saved</span>
@@ -1060,6 +1071,7 @@ async function bindBudget() {
     await api('/budget/config', { method: 'PUT', body: JSON.stringify({ config: {
       policy: document.getElementById('b_policy').value,
       required: document.getElementById('b_required').checked,
+      cacheMinutes: Number(document.getElementById('b_cache').value) || 5,
     } }) });
     const ok = document.getElementById('bGlobalSaved'); ok.classList.remove('hidden'); setTimeout(() => ok.classList.add('hidden'), 2000);
   };

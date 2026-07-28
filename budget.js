@@ -197,11 +197,12 @@ function budgetLinesOf(r) {
   return [];
 }
 
-async function readDeptLinesRaw(dept) {
-  const cached = linesCacheByDept[dept.id];
-  const cfg = getBudgetConfig();
-  const ttl = Math.max(1, Number(cfg.cacheMinutes || 5)) * 60000;
-  if (cached && cached.key === deptCacheKey(dept) && Date.now() - cached.at < ttl) return cached.lines;
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+/* Read a department's tracker lines from its backend (local file or Graph),
+   with retry-on-failure and stale-cache fallback so a workbook that's briefly
+   locked (e.g. someone has it open in Excel) doesn't surface as an error. */
+async function readDeptLinesFresh(dept) {
   let lines = [];
   if (dept.mode === 'local') {
     const { sheets } = await readWorkbookLocal(dept.localPath);
@@ -217,22 +218,49 @@ async function readDeptLinesRaw(dept) {
       lines = lines.concat(parseTrackerRows(rows, pair.trackerSheet, pair.logSheet, dept, null));
     }
   }
-  linesCacheByDept[dept.id] = { at: Date.now(), lines, key: deptCacheKey(dept) };
   return lines;
+}
+
+async function readDeptLinesRaw(dept, force) {
+  const cached = linesCacheByDept[dept.id];
+  const cfg = getBudgetConfig();
+  const ttl = Math.max(1, Number(cfg.cacheMinutes || 5)) * 60000;
+  // fresh-enough cache → serve immediately (unless a forced refresh is requested)
+  if (!force && cached && cached.key === deptCacheKey(dept) && Date.now() - cached.at < ttl) {
+    return { lines: cached.lines, stale: false, cachedAt: cached.at };
+  }
+  // otherwise read live, retrying a couple of times for transient locks/throttling
+  const maxAttempts = 3;
+  let lastErr;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const lines = await readDeptLinesFresh(dept);
+      linesCacheByDept[dept.id] = { at: Date.now(), lines, key: deptCacheKey(dept) };
+      return { lines, stale: false, cachedAt: Date.now() };
+    } catch (e) {
+      lastErr = e;
+      if (attempt < maxAttempts) await sleep(600 * attempt); // 0.6s, 1.2s backoff
+    }
+  }
+  // all attempts failed — fall back to last-known-good data if we have any
+  if (cached && cached.key === deptCacheKey(dept)) {
+    return { lines: cached.lines, stale: true, cachedAt: cached.at, error: lastErr.message };
+  }
+  // nothing cached to fall back to — surface the error
+  throw lastErr;
 }
 
 /* Lines for a single department (with live holds applied). */
 async function getDeptLines(deptId, force) {
   const dept = getDept(deptId);
   if (!dept || dept.mode === 'off') return { deptId, lines: [] };
-  if (force) clearLinesCache(deptId);
-  const raw = await readDeptLinesRaw(dept);
+  const raw = await readDeptLinesRaw(dept, force);
   const held = computeHeldAmounts();
-  const lines = raw.map(l => {
+  const lines = raw.lines.map(l => {
     const h = held[heldKey(l.deptId, l.code)] || 0;
     return Object.assign({}, l, { rawAvailable: l.available, held: h, available: l.available - h });
   });
-  return { deptId, deptName: dept.name, lines };
+  return { deptId, deptName: dept.name, lines, stale: raw.stale, cachedAt: raw.cachedAt, staleError: raw.error };
 }
 
 /* All lines across departments a user may access (used by admin + budget views). */
@@ -240,11 +268,16 @@ async function getBudgetLinesForUser(userId, force) {
   const depts = departmentsForUser(userId, false);
   let lines = [];
   const errors = [];
+  const staleDepts = [];
   for (const d of depts) {
-    try { const res = await getDeptLines(d.id, force); lines = lines.concat(res.lines); }
+    try {
+      const res = await getDeptLines(d.id, force);
+      lines = lines.concat(res.lines);
+      if (res.stale) staleDepts.push({ dept: d.name, cachedAt: res.cachedAt });
+    }
     catch (e) { errors.push({ dept: d.name, error: e.message }); }
   }
-  return { lines, errors, departments: depts.map(d => ({ id: d.id, name: d.name })) };
+  return { lines, errors, stale: staleDepts, departments: depts.map(d => ({ id: d.id, name: d.name })) };
 }
 
 /* ---------- append the PRQ log rows (the actual deduction) ---------- */
