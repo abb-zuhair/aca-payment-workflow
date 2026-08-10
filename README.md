@@ -39,6 +39,42 @@ railway run node reset-admin-password.js NewPassword123!
 This only touches the admin's password hash — no other data is affected —
 and forces a fresh password to be set on next login.
 
+## Security
+
+Hardening built into the app:
+
+- **Password storage:** bcrypt hashes; passwords are never stored or logged.
+- **Brute-force protection:** after 5 consecutive failed logins an account is
+  locked for 15 minutes (configurable via `MAX_FAILED_LOGINS` and
+  `LOCKOUT_MINUTES`). A coarse per-IP throttle (`IP_MAX_LOGIN_ATTEMPTS`,
+  default 20 per 5 minutes) blunts distributed guessing and username probing.
+  Lockouts are recorded in the audit log, and an admin can clear one with the
+  **Unlock** button in User Management.
+- **Security headers** via helmet: Content-Security-Policy (no inline scripts,
+  framing blocked), HSTS in production, `nosniff`, `Referrer-Policy`, and no
+  `X-Powered-By` stack disclosure.
+- **Sessions** are stored in the database (not memory), so logins survive
+  restarts and redeploys. **This requires `SESSION_SECRET` to be set** — if it
+  isn't, a random secret is generated per boot and everyone is logged out on
+  every restart. Deactivating or locking a user immediately revokes their
+  sessions.
+- **Cookies:** `httpOnly`, `sameSite=lax`, and `secure` in production.
+- **SQL injection:** all queries use bound parameters — no string-built SQL.
+- **Uploads:** restricted to PDF/JPG/PNG/WEBP, 10 MB, max 10 per request;
+  stored under generated filenames (no user-controlled paths), and served only
+  to authenticated users with per-request authorization checks.
+- **Authorization** is enforced server-side on every endpoint, not just hidden
+  in the UI.
+
+Things this does **not** do, which are your responsibility:
+
+- **Restrict who can reach the site.** The strongest control available is to
+  not expose it publicly at all — put it behind your VPN, restrict by IP, or
+  front it with SSO. That removes most of the attack surface outright.
+- **Independent security review.** The above is sound practice, but a system
+  authorising payments deserves a third-party review before public exposure.
+- **Dependency updates.** Run `npm audit` periodically and keep Node patched.
+
 ## Backups (important)
 
 All data — users, requests, approvals, settings, and the audit log — lives in

@@ -90,6 +90,19 @@ CREATE TABLE IF NOT EXISTS group_members (
   }
 })();
 
+/* migration: brute-force protection — track consecutive failures and lockout expiry */
+(function migrateLoginLockout() {
+  const cols = db.prepare(`PRAGMA table_info(users)`).all().map(c => c.name);
+  if (!cols.includes('failed_logins')) {
+    db.exec(`ALTER TABLE users ADD COLUMN failed_logins INTEGER NOT NULL DEFAULT 0`);
+    console.log('DB migration: users.failed_logins added');
+  }
+  if (!cols.includes('locked_until')) {
+    db.exec(`ALTER TABLE users ADD COLUMN locked_until TEXT`);
+    console.log('DB migration: users.locked_until added');
+  }
+})();
+
 /* migration: multi-role — users can hold their primary role plus an admin extra */
 (function migrateExtraAdmin() {
   const cols = db.prepare(`PRAGMA table_info(users)`).all().map(c => c.name);

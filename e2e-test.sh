@@ -3,7 +3,7 @@ set -e
 cd "$(dirname "$0")"
 rm -rf data/payments.db data/payments.db-* data/uploads/* 2>/dev/null || true
 
-ADMIN_PASSWORD='Aca@Admin2026' PORT=3456 node server.js > server.log 2>&1 &
+ADMIN_PASSWORD='Aca@Admin2026' PORT=3456 IP_MAX_LOGIN_ATTEMPTS=500 SESSION_SECRET='stable-test-secret' node server.js > server.log 2>&1 &
 SERVER_PID=$!
 # wait until the server answers before starting tests
 for i in $(seq 1 30); do
@@ -831,6 +831,43 @@ node "$(dirname "$0")/test-stale-cache.js" > /tmp/stale_out.log 2>&1
 check "$?" "0" "failed live read serves last-known-good data instead of erroring"
 cat /tmp/stale_out.log | sed 's/^/  /'
 
+echo "== Security headers present =="
+HDRS=$(curl -s --noproxy '*' -D - -o /dev/null http://localhost:3456/)
+check "$(echo "$HDRS" | grep -ci 'content-security-policy')" "1" "Content-Security-Policy header sent"
+check "$(echo "$HDRS" | grep -ci 'x-content-type-options')" "1" "X-Content-Type-Options header sent"
+check "$(echo "$HDRS" | grep -ci 'referrer-policy')" "1" "Referrer-Policy header sent"
+check "$(echo "$HDRS" | grep -ci 'x-powered-by')" "0" "X-Powered-By header removed (no stack disclosure)"
+check "$(echo "$HDRS" | grep -i 'content-security-policy' | grep -c "frame-ancestors 'none'")" "1" "CSP blocks framing (clickjacking)"
+
+echo "== Account lockout after repeated failed logins =="
+req admin -X POST $B/users -H 'Content-Type: application/json' -d '{"name":"Locky","role":"requestor","password":"Test12345"}' > /dev/null
+LOCKID=$(req admin $B/users | pyget "print([u['id'] for u in d['users'] if u['name']=='Locky'][0])")
+for i in 1 2 3 4; do
+  curl -s --noproxy '*' -o /dev/null -X POST $B/login -H 'Content-Type: application/json' -d '{"name":"Locky","password":"WrongPass1"}'
+done
+# 4 failures so far: still just rejected, not locked
+CODE=$(curl -s --noproxy '*' -o /dev/null -w '%{http_code}' -X POST $B/login -H 'Content-Type: application/json' -d '{"name":"Locky","password":"WrongPass1"}')
+check "$CODE" "429" "5th consecutive failure locks the account (429)"
+check "$(req admin $B/users | pyget "print([u['locked'] for u in d['users'] if u['name']=='Locky'][0])")" "True" "admin sees the account as locked"
+# even the CORRECT password is refused while locked
+CODE=$(curl -s --noproxy '*' -o /dev/null -w '%{http_code}' -X POST $B/login -H 'Content-Type: application/json' -d '{"name":"Locky","password":"Test12345"}')
+check "$CODE" "429" "correct password still refused while locked"
+check "$(req admin $B/audit | pyget "print(any('Account locked' in a['action'] for a in d['audit']))")" "True" "lockout recorded in the audit log"
+
+echo "== Admin can unlock a locked account =="
+req admin -X PATCH $B/users/$LOCKID -H 'Content-Type: application/json' -d '{"unlock":true}' > /dev/null
+check "$(req admin $B/users | pyget "print([u['locked'] for u in d['users'] if u['name']=='Locky'][0])")" "False" "account shows unlocked"
+R=$(req locky -X POST $B/login -H 'Content-Type: application/json' -d '{"name":"Locky","password":"Test12345"}')
+check "$(echo $R | pyget "print(d['user']['name'])")" "Locky" "user can log in again after unlock"
+
+echo "== A successful login clears the failure counter =="
+curl -s --noproxy '*' -o /dev/null -X POST $B/login -H 'Content-Type: application/json' -d '{"name":"Locky","password":"WrongPass1"}'
+req locky -X POST $B/login -H 'Content-Type: application/json' -d '{"name":"Locky","password":"Test12345"}' > /dev/null
+check "$(req admin $B/users | pyget "print([u['failedLogins'] for u in d['users'] if u['name']=='Locky'][0])")" "0" "failure counter reset after a good login"
+
+echo "== Sessions are stored in the database (survive restart) =="
+check "$(req admin $B/audit > /dev/null; echo ok)" "ok" "admin session active before restart"
+
 echo "== Frontend served =="
 CODE=$(curl -s --noproxy '*' -o /dev/null -w '%{http_code}' http://localhost:3456/)
 check "$CODE" "200" "index.html serves"
@@ -846,14 +883,26 @@ check "$?" "0" "reset script runs successfully"
 grep -q "Password reset for 1 admin" /tmp/reset_out.log
 check "$?" "0" "reset script reports 1 admin updated"
 
-ADMIN_PASSWORD='ShouldBeIgnored123' PORT=3456 node server.js > server.log 2>&1 &
+ADMIN_PASSWORD='ShouldBeIgnored123' PORT=3456 IP_MAX_LOGIN_ATTEMPTS=3 SESSION_SECRET='stable-test-secret' node server.js > server.log 2>&1 &
 SERVER_PID2=$!
 for i in $(seq 1 30); do curl -s --noproxy '*' -o /dev/null http://localhost:3456/ && break; sleep 0.3; done
+echo "== Session survived the restart (persistent store) =="
+R=$(req locky $B/me)
+check "$(echo $R | pyget "print(d['user']['name'] if d.get('user') else 'LOGGED_OUT')")" "Locky" "session from before the restart is still valid"
+
 R=$(curl -s --noproxy '*' -X POST $B/login -H 'Content-Type: application/json' -d '{"name":"admin","password":"Aca@Admin2026"}')
 check "$(echo $R | pyget "print('error' in d)")" "True" "old admin password no longer works after reset"
 R=$(curl -s --noproxy '*' -X POST $B/login -H 'Content-Type: application/json' -d '{"name":"admin","password":"ResetByScript123"}')
 check "$(echo $R | pyget "print(d['user']['role'])")" "admin" "new password from reset script works"
 check "$(echo $R | pyget "print(d['user']['mustChangePassword'])")" "True" "reset forces password change on next login"
+
+echo "== Per-IP login throttling =="
+for i in 1 2 3 4; do
+  curl -s --noproxy '*' -o /dev/null -X POST $B/login -H 'Content-Type: application/json' -d '{"name":"NoSuchUser","password":"x"}'
+done
+CODE=$(curl -s --noproxy '*' -o /dev/null -w '%{http_code}' -X POST $B/login -H 'Content-Type: application/json' -d '{"name":"NoSuchUser","password":"x"}')
+check "$CODE" "429" "repeated attempts from one IP are throttled"
+
 kill $SERVER_PID2 2>/dev/null
 
 echo

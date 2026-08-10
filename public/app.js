@@ -788,8 +788,12 @@ async function adminUsers() {
           </select>
         </td>
         <td style="text-align:center;" title="Also an administrator"><input type="checkbox" data-admin-for="${u.id}" ${u.extraAdmin ? 'checked' : ''}></td>
-        <td><span class="user-badge">${u.active ? 'Active' : 'Deactivated'}</span></td>
+        <td>
+          <span class="user-badge">${u.active ? 'Active' : 'Deactivated'}</span>
+          ${u.locked ? `<span class="user-badge" style="background:var(--red-bg);color:var(--red);" title="Locked after too many failed logins — until ${esc(u.lockedUntil || '')}">🔒 Locked</span>` : ''}
+        </td>
         <td style="text-align:right;white-space:nowrap;">
+          ${u.locked ? `<button class="mini-btn react" data-unlock="${u.id}">Unlock</button>` : ''}
           <button class="mini-btn react" data-resetpw="${u.id}">Reset password</button>
           <button class="mini-btn ${u.active ? 'deact' : 'react'}" data-toggle="${u.id}">${u.active ? 'Deactivate' : 'Reactivate'}</button>
           <button class="mini-btn del" data-del="${u.id}">Remove</button>
@@ -1458,6 +1462,10 @@ function bindAdmin() {
       render();
     } catch (e) { errEl.textContent = e.message; errEl.classList.remove('hidden'); }
   };
+  document.querySelectorAll('[data-unlock]').forEach(b => b.onclick = async () => {
+    try { await api('/users/' + b.dataset.unlock, { method: 'PATCH', body: JSON.stringify({ unlock: true }) }); render(); }
+    catch (e) { alert(e.message); }
+  });
   document.querySelectorAll('[data-admin-for]').forEach(chk => chk.onchange = async () => {
     try { await api('/users/' + chk.dataset.adminFor, { method: 'PATCH', body: JSON.stringify({ extraAdmin: chk.checked }) }); render(); }
     catch (e) { alert(e.message); render(); }

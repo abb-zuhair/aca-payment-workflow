@@ -1,5 +1,7 @@
 const express = require('express');
 const session = require('express-session');
+const helmet = require('helmet');
+const { SqliteSessionStore } = require('./session-store');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
@@ -15,10 +17,47 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.json({ limit: '2mb' }));
 app.set('trust proxy', 1);
+app.disable('x-powered-by');
+
+/* ---------- security headers ----------
+   CSP is tuned to what this app actually loads: its own /app.js (no inline
+   scripts), Google Fonts, and images/PDFs served from our own API. Inline
+   *styles* are allowed because the UI composes style="..." attributes. */
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
+      fontSrc: ["'self'", 'https://fonts.gstatic.com', 'data:'],
+      imgSrc: ["'self'", 'data:', 'blob:'],
+      objectSrc: ["'self'"],           // inline PDF attachment preview
+      frameSrc: ["'self'"],
+      connectSrc: ["'self'"],
+      formAction: ["'self'"],
+      frameAncestors: ["'none'"],      // clickjacking protection
+      baseUri: ["'self'"],
+      upgradeInsecureRequests: process.env.NODE_ENV === 'production' ? [] : null,
+    },
+  },
+  crossOriginEmbedderPolicy: false,    // would break Google Fonts / inline previews
+  hsts: process.env.NODE_ENV === 'production'
+    ? { maxAge: 15552000, includeSubDomains: true }
+    : false,
+  referrerPolicy: { policy: 'same-origin' },
+}));
+
+const sessionStore = new SqliteSessionStore({ ttlMs: 8 * 60 * 60 * 1000 });
+if (process.env.NODE_ENV === 'production' && !process.env.SESSION_SECRET) {
+  console.warn('WARNING: SESSION_SECRET is not set — sessions will be invalidated on restart. Set it in your environment.');
+}
 app.use(session({
+  store: sessionStore,
   secret: process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex'),
   resave: false,
   saveUninitialized: false,
+  rolling: true,                       // slide the 8h window while actively used
+  name: 'aca.sid',
   cookie: {
     httpOnly: true,
     sameSite: 'lax',
@@ -141,7 +180,13 @@ function requireRole(...roles) {
   };
 }
 function publicUser(u) {
-  return { id: u.id, name: u.name, email: u.email, role: u.role, extraAdmin: !!u.extra_admin, active: !!u.active, mustChangePassword: !!u.must_change_password };
+  const lockedMs = u.locked_until ? new Date(u.locked_until).getTime() - Date.now() : 0;
+  return {
+    id: u.id, name: u.name, email: u.email, role: u.role, extraAdmin: !!u.extra_admin,
+    active: !!u.active, mustChangePassword: !!u.must_change_password,
+    locked: lockedMs > 0, lockedUntil: lockedMs > 0 ? u.locked_until : null,
+    failedLogins: u.failed_logins || 0,
+  };
 }
 function loadRequest(id) {
   const row = db.prepare(`SELECT json FROM requests WHERE id=?`).get(id);
@@ -203,13 +248,79 @@ function requestorEmail(r) {
   return u && u.email ? [u.email] : [];
 }
 
+// ---------- brute-force protection ----------
+/* Per-account lockout (persisted in the DB, so it survives restarts) plus a
+   coarse per-IP throttle to blunt distributed guessing and username probing. */
+const MAX_FAILED_LOGINS = Number(process.env.MAX_FAILED_LOGINS || 5);
+const LOCKOUT_MINUTES = Number(process.env.LOCKOUT_MINUTES || 15);
+const IP_MAX_ATTEMPTS = Number(process.env.IP_MAX_LOGIN_ATTEMPTS || 20);
+const IP_WINDOW_MS = 5 * 60 * 1000;
+
+const ipAttempts = new Map(); // ip -> { count, windowStart }
+function ipThrottled(ip) {
+  const now = Date.now();
+  const rec = ipAttempts.get(ip);
+  if (!rec || now - rec.windowStart > IP_WINDOW_MS) {
+    ipAttempts.set(ip, { count: 1, windowStart: now });
+    return false;
+  }
+  rec.count++;
+  return rec.count > IP_MAX_ATTEMPTS;
+}
+function clearIpAttempts(ip) { ipAttempts.delete(ip); }
+/* keep the map from growing without bound */
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, rec] of ipAttempts) if (now - rec.windowStart > IP_WINDOW_MS) ipAttempts.delete(ip);
+}, IP_WINDOW_MS).unref?.();
+
+function lockRemainingMinutes(u) {
+  if (!u || !u.locked_until) return 0;
+  const ms = new Date(u.locked_until).getTime() - Date.now();
+  return ms > 0 ? Math.ceil(ms / 60000) : 0;
+}
+
 // ---------- auth ----------
 app.post('/api/login', (req, res) => {
   const { name, password } = req.body || {};
+  const ip = req.ip || req.connection?.remoteAddress || 'unknown';
   if (!name || !password) return res.status(400).json({ error: 'Name and password required' });
+
+  if (ipThrottled(ip)) {
+    audit(null, String(name).trim(), `Login throttled — too many attempts from ${ip}`);
+    return res.status(429).json({ error: 'Too many login attempts. Please wait a few minutes and try again.' });
+  }
+
   const u = db.prepare(`SELECT * FROM users WHERE name=?`).get(String(name).trim());
-  if (!u || !bcrypt.compareSync(password, u.password_hash)) return res.status(401).json({ error: 'Invalid name or password' });
+
+  // account currently locked?
+  const remaining = lockRemainingMinutes(u);
+  if (u && remaining > 0) {
+    return res.status(429).json({ error: `This account is temporarily locked after too many failed attempts. Try again in ${remaining} minute${remaining > 1 ? 's' : ''}, or ask an administrator to unlock it.` });
+  }
+
+  const ok = u && bcrypt.compareSync(password, u.password_hash);
+  if (!ok) {
+    if (u) {
+      const failed = (u.failed_logins || 0) + 1;
+      if (failed >= MAX_FAILED_LOGINS) {
+        const until = new Date(Date.now() + LOCKOUT_MINUTES * 60000).toISOString();
+        db.prepare(`UPDATE users SET failed_logins=0, locked_until=? WHERE id=?`).run(until, u.id);
+        sessionStore.destroyForUser(u.id); // kill any existing sessions for safety
+        audit(null, u.name, `Account locked for ${LOCKOUT_MINUTES} minutes after ${MAX_FAILED_LOGINS} failed login attempts (from ${ip})`);
+        return res.status(429).json({ error: `Too many failed attempts — this account is locked for ${LOCKOUT_MINUTES} minutes.` });
+      }
+      db.prepare(`UPDATE users SET failed_logins=? WHERE id=?`).run(failed, u.id);
+      audit(null, u.name, `Failed login attempt (${failed}/${MAX_FAILED_LOGINS}) from ${ip}`);
+    }
+    // identical response whether or not the account exists
+    return res.status(401).json({ error: 'Invalid name or password' });
+  }
+
   if (!u.active) return res.status(403).json({ error: 'This account has been deactivated by the administrator' });
+
+  db.prepare(`UPDATE users SET failed_logins=0, locked_until=NULL WHERE id=?`).run(u.id);
+  clearIpAttempts(ip);
   req.session.user = { id: u.id, name: u.name, role: u.role, extraAdmin: !!u.extra_admin };
   audit(null, u.name, 'Logged in');
   res.json({ user: publicUser(u) });
@@ -275,7 +386,12 @@ app.patch('/api/users/:id', requireRole('admin'), (req, res) => {
   if (active !== undefined) {
     if (u.role === 'admin') return res.status(400).json({ error: 'Cannot deactivate the admin account' });
     db.prepare(`UPDATE users SET active=? WHERE id=?`).run(active ? 1 : 0, u.id);
+    if (!active) sessionStore.destroyForUser(u.id); // log them out immediately
     audit(null, req.session.user.name, `${active ? 'Reactivated' : 'Deactivated'} ${u.name}`);
+  }
+  if (req.body && req.body.unlock) {
+    db.prepare(`UPDATE users SET failed_logins=0, locked_until=NULL WHERE id=?`).run(u.id);
+    audit(null, req.session.user.name, `Unlocked ${u.name} after failed login lockout`);
   }
   if (resetPassword) {
     if (resetPassword.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
