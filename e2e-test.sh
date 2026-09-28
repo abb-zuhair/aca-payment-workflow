@@ -651,6 +651,78 @@ check "$(echo $R | pyget "print('error' in d)")" "True" "non-image signature rej
 CODE=$(curl -s --noproxy '*' -o /dev/null -w '%{http_code}' $B/signature/$LID/signature)
 check "$CODE" "401" "signature requires auth to view"
 
+echo "== Database-backed department: create and import Excel =="
+R=$(req admin -X POST $B/budget/departments -H 'Content-Type: application/json' -d '{"name":"DBDept","mode":"db"}')
+DEPT_DB=$(echo $R | pyget "print([x['id'] for x in d['config']['departments'] if x['name']=='DBDept'][0])")
+check "$(echo $R | pyget "print([x['mode'] for x in d['config']['departments'] if x['name']=='DBDept'][0])")" "db" "database-backed department created"
+# empty before import
+check "$(req admin "$B/budget/lines?dept=$DEPT_DB" | pyget "print(len(d['lines']))")" "0" "no lines before import"
+# import the sample workbook
+R=$(req admin -X POST $B/budget/departments/$DEPT_DB/import -F "file=@$(dirname "$0")/samples/sample-budget-workbook.xlsx")
+check "$(echo $R | pyget "print(d['result']['linesAdded'] > 100)")" "True" "import added 100+ budget lines"
+IMPORTED=$(req admin "$B/budget/lines?dept=$DEPT_DB" | pyget "print(len(d['lines']))")
+check "$(req admin "$B/budget/lines?dept=$DEPT_DB" | pyget "print(len(d['lines']) > 100)")" "True" "lines readable from the database ($IMPORTED)"
+check "$(req admin "$B/budget/lines?dept=$DEPT_DB" | pyget "print(any(l['code']=='ACAH-CON-02' for l in d['lines']))")" "True" "ACAH-CON-02 present in the database"
+
+echo "== Re-importing the same file does not double-count =="
+AV1=$(req admin "$B/budget/lines?dept=$DEPT_DB" | pyget "print([l['available'] for l in d['lines'] if l['code']=='ACAH-CON-02'][0])")
+R=$(req admin -X POST $B/budget/departments/$DEPT_DB/import -F "file=@$(dirname "$0")/samples/sample-budget-workbook.xlsx")
+check "$(echo $R | pyget "print(d['result']['linesAdded'])")" "0" "second import adds no duplicate lines"
+check "$(echo $R | pyget "print(d['result']['linesUpdated'] > 100)")" "True" "second import updates existing lines instead"
+AV2=$(req admin "$B/budget/lines?dept=$DEPT_DB" | pyget "print([l['available'] for l in d['lines'] if l['code']=='ACAH-CON-02'][0])")
+python3 -c "assert abs(float('$AV1') - float('$AV2')) < 0.001, 'available changed on re-import: $AV1 -> $AV2'"
+check "$?" "0" "available balance unchanged after re-import (spend not double-counted)"
+
+echo "== Database department: full request lifecycle deducts from the ledger =="
+req admin -X PUT "$B/users/$ZID/departments" -H 'Content-Type: application/json' -d "{\"departments\":[]}" > /dev/null
+R=$(req zuhair -X POST $B/requests -F department=IT -F payeeName=DBVendor -F 'paymentType=Supplier Payment' -F paymentMethod=Cheque -F amount=200 -F currency=KWD -F 'description=database budget test' -F 'customFieldValues={}' -F budgetDept=$DEPT_DB -F "budgetLines=[{\"deptId\":\"$DEPT_DB\",\"code\":\"ACAH-CON-02\",\"amount\":200}]")
+RIDDB=$(echo $R | pyget "print(d['request']['id'])")
+check "$(echo $R | pyget "print(d['request']['budgetLines'][0]['code'])")" "ACAH-CON-02" "request charged to a database budget line"
+req layla -X POST $B/requests/$RIDDB/decision -H 'Content-Type: application/json' -d '{"decision":"approved"}' > /dev/null
+req fatima -X POST $B/requests/$RIDDB/decision -H 'Content-Type: application/json' -d '{"decision":"approved"}' > /dev/null
+req ahmed -X POST $B/requests/$RIDDB/decision -H 'Content-Type: application/json' -d '{"decision":"approved"}' > /dev/null
+req sara -X POST $B/requests/$RIDDB/decision -H 'Content-Type: application/json' -d '{"decision":"approved"}' > /dev/null
+# held (reserved) but not yet deducted
+HELD_DB=$(req admin "$B/budget/lines?dept=$DEPT_DB" | pyget "print([l['held'] for l in d['lines'] if l['code']=='ACAH-CON-02'][0])")
+check "$HELD_DB" "200" "amount held after budget approval, before finalize"
+req nadia -X POST $B/requests/$RIDDB/decision -H 'Content-Type: application/json' -d '{"decision":"approved"}' > /dev/null
+req fatima -X POST $B/requests/$RIDDB/finalize -H 'Content-Type: application/json' -d '{"paymentRef":"DB-CHQ-1"}' > /dev/null
+for i in $(seq 1 40); do
+  ST=$(req admin $B/requests | pyget "print([r.get('budgetSync',{}).get('status') for r in d['requests'] if r['id']=='$RIDDB'][0])" 2>/dev/null)
+  [ "$ST" = "synced" ] && break; [ "$ST" = "failed" ] && break; sleep 0.3
+done
+check "$ST" "synced" "finalize wrote to the database ledger"
+AV3=$(req admin "$B/budget/lines?dept=$DEPT_DB" | pyget "print([l['available'] for l in d['lines'] if l['code']=='ACAH-CON-02'][0])")
+python3 -c "assert abs((float('$AV2') - float('$AV3')) - 200) < 0.001, 'expected 200 deduction, got %s' % (float('$AV2')-float('$AV3'))"
+check "$?" "0" "available reduced by exactly 200 after finalize"
+HELD_DB2=$(req admin "$B/budget/lines?dept=$DEPT_DB" | pyget "print([l['held'] for l in d['lines'] if l['code']=='ACAH-CON-02'][0])")
+check "$HELD_DB2" "0" "hold released once finalized (no double-count)"
+
+echo "== Ledger records the payment =="
+R=$(req admin "$B/budget/departments/$DEPT_DB/ledger?code=ACAH-CON-02")
+check "$(echo $R | pyget "print(any(e['request_id']=='$RIDDB' and abs(e['amount']-200)<0.001 for e in d['entries']))")" "True" "ledger entry created for the finalized request"
+check "$(echo $R | pyget "print(any(e['source']=='app' for e in d['entries']))")" "True" "app-generated entries tagged as such"
+
+echo "== Manual ledger adjustment (admin) =="
+req admin -X POST $B/budget/departments/$DEPT_DB/ledger -H 'Content-Type: application/json' -d '{"code":"ACAH-CON-02","amount":50,"description":"Correction"}' > /dev/null
+AV4=$(req admin "$B/budget/lines?dept=$DEPT_DB" | pyget "print([l['available'] for l in d['lines'] if l['code']=='ACAH-CON-02'][0])")
+python3 -c "assert abs((float('$AV3') - float('$AV4')) - 50) < 0.001, 'manual entry should reduce available by 50'"
+check "$?" "0" "manual adjustment reduces available by 50"
+R=$(req admin -X POST $B/budget/departments/$DEPT_DB/ledger -H 'Content-Type: application/json' -d '{"code":"NOPE-XX-99","amount":10}')
+check "$(echo $R | pyget "print('Unknown budget line' in d.get('error',''))")" "True" "manual entry rejected for unknown code"
+
+echo "== Re-import after spending preserves recorded spend =="
+AVB=$(req admin "$B/budget/lines?dept=$DEPT_DB" | pyget "print([l['available'] for l in d['lines'] if l['code']=='ACAH-CON-02'][0])")
+req admin -X POST $B/budget/departments/$DEPT_DB/import -F "file=@$(dirname "$0")/samples/sample-budget-workbook.xlsx" > /dev/null
+AVC=$(req admin "$B/budget/lines?dept=$DEPT_DB" | pyget "print([l['available'] for l in d['lines'] if l['code']=='ACAH-CON-02'][0])")
+python3 -c "assert abs(float('$AVB') - float('$AVC')) < 0.001, 'spend lost or duplicated on re-import: $AVB -> $AVC'"
+check "$?" "0" "re-import keeps the 200 payment and 50 adjustment intact"
+check "$(req admin "$B/budget/departments/$DEPT_DB/ledger?code=ACAH-CON-02" | pyget "print(sum(1 for e in d['entries'] if e['request_id']=='$RIDDB'))")" "1" "no duplicate ledger row for the finalized request"
+
+echo "== OneDrive/local departments still work alongside database ones =="
+check "$(req admin $B/budget/config | pyget "print(sorted(set(x['mode'] for x in d['config']['departments'])))")" "['db', 'local']" "both backends coexist"
+check "$(req admin $B/budget/lines | pyget "print(len(set(l['deptName'] for l in d['lines'])) >= 2)")" "True" "combined view spans both backends"
+
 echo "== Budget Supervisor can view budget lines (search list) =="
 req ahmed -X POST $B/login -H 'Content-Type: application/json' -d '{"name":"Ahmed","password":"Test12345"}' > /dev/null
 R=$(req ahmed $B/budget/lines)

@@ -90,6 +90,45 @@ CREATE TABLE IF NOT EXISTS group_members (
   }
 })();
 
+/* migration: database-backed budgets — lines and their spend ledger live here
+   instead of (or alongside) an Excel workbook. */
+(function migrateBudgetTables() {
+  db.exec(`
+CREATE TABLE IF NOT EXISTS budget_lines (
+  id          TEXT PRIMARY KEY,
+  dept_id     TEXT NOT NULL,
+  code        TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  gl          TEXT NOT NULL DEFAULT '',
+  line_no     TEXT NOT NULL DEFAULT '',
+  budget      REAL NOT NULL DEFAULT 0,
+  adjust      REAL NOT NULL DEFAULT 0,
+  sheet       TEXT NOT NULL DEFAULT '',
+  created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (dept_id, code)
+);
+CREATE INDEX IF NOT EXISTS idx_budget_lines_dept ON budget_lines(dept_id);
+
+CREATE TABLE IF NOT EXISTS budget_ledger (
+  id          TEXT PRIMARY KEY,
+  dept_id     TEXT NOT NULL,
+  code        TEXT NOT NULL,
+  entry_date  TEXT NOT NULL DEFAULT '',
+  ref         TEXT NOT NULL DEFAULT '',
+  description TEXT NOT NULL DEFAULT '',
+  amount      REAL NOT NULL DEFAULT 0,
+  remarks     TEXT NOT NULL DEFAULT '',
+  source      TEXT NOT NULL DEFAULT 'import',  -- 'import' | 'app' | 'manual'
+  request_id  TEXT,
+  import_key  TEXT UNIQUE,                     -- dedupes repeated spreadsheet imports
+  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_budget_ledger_line ON budget_ledger(dept_id, code);
+CREATE INDEX IF NOT EXISTS idx_budget_ledger_req ON budget_ledger(request_id);
+`);
+})();
+
 /* migration: brute-force protection — track consecutive failures and lockout expiry */
 (function migrateLoginLockout() {
   const cols = db.prepare(`PRAGMA table_info(users)`).all().map(c => c.name);

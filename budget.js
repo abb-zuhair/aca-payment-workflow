@@ -197,6 +197,44 @@ function budgetLinesOf(r) {
   return [];
 }
 
+/* ---------- database-backed budgets ----------
+   Lines live in budget_lines; spend lives in budget_ledger (the DB equivalent
+   of a Log sheet). Utilized is summed from the ledger, exactly as the workbook's
+   SUMIF did, so the arithmetic matches what finance is used to. */
+function dbLinesFor(dept) {
+  const rows = db.prepare(`SELECT * FROM budget_lines WHERE dept_id=? ORDER BY code`).all(dept.id);
+  const spent = db.prepare(`SELECT code, SUM(amount) total FROM budget_ledger WHERE dept_id=? GROUP BY code`).all(dept.id);
+  const byCode = {};
+  for (const s of spent) byCode[s.code] = Number(s.total) || 0;
+  return rows.map(r => {
+    const utilized = byCode[r.code] || 0;
+    return {
+      code: r.code,
+      line: r.line_no || '',
+      description: r.description || '',
+      gl: r.gl || '',
+      budget: Number(r.budget) || 0,
+      utilized,
+      adjust: Number(r.adjust) || 0,
+      available: (Number(r.budget) || 0) + (Number(r.adjust) || 0) - utilized,
+      trackerSheet: r.sheet || '',
+      logSheet: r.sheet || '',
+      deptId: dept.id, deptName: dept.name,
+    };
+  });
+}
+
+/* record a request's split line against a database-backed department */
+function addLedgerEntry(deptId, entry) {
+  const id = 'bl_' + Date.now() + '_' + crypto.randomBytes(4).toString('hex');
+  db.prepare(`INSERT INTO budget_ledger (id,dept_id,code,entry_date,ref,description,amount,remarks,source,request_id,import_key)
+              VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(id, deptId, entry.code, entry.date || '', entry.ref || '', entry.description || '',
+         Number(entry.amount) || 0, entry.remarks || '', entry.source || 'app',
+         entry.requestId || null, entry.importKey || null);
+  return id;
+}
+
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 /* Read a department's tracker lines from its backend (local file or Graph),
@@ -222,6 +260,11 @@ async function readDeptLinesFresh(dept) {
 }
 
 async function readDeptLinesRaw(dept, force) {
+  /* database-backed departments are local and instant — no cache, no retry,
+     no chance of a locked workbook, so read them directly every time. */
+  if (dept.mode === 'db') {
+    return { lines: dbLinesFor(dept), stale: false, cachedAt: Date.now() };
+  }
   const cached = linesCacheByDept[dept.id];
   const cfg = getBudgetConfig();
   const ttl = Math.max(1, Number(cfg.cacheMinutes || 5)) * 60000;
@@ -295,6 +338,17 @@ async function appendOneLine(dept, request, ln) {
   const dateStr = (request.completedAt || new Date().toISOString()).slice(0, 10);
   const desc = `${request.payeeName} — ${request.description}`.slice(0, 200);
   const remark = 'Auto: payment workflow';
+  if (dept.mode === 'db') {
+    /* guard against a double-write if a retry lands twice for the same line */
+    const existing = db.prepare(`SELECT id FROM budget_ledger WHERE request_id=? AND code=? AND dept_id=?`)
+      .get(request.id, ln.code, dept.id);
+    if (existing) return { sheet: 'database', row: 0, ledgerId: existing.id };
+    const id = addLedgerEntry(dept.id, {
+      code: ln.code, date: dateStr, ref: request.id, description: desc,
+      amount: Number(ln.amount), remarks: remark, source: 'app', requestId: request.id,
+    });
+    return { sheet: 'database', row: 0, ledgerId: id };
+  }
   if (dept.mode === 'local') {
     const { sheets, _wb } = await readWorkbookLocal(dept.localPath);
     if (!sheets[ln.logSheet]) throw new Error(`Log sheet "${ln.logSheet}" not found in ${dept.name} workbook`);
@@ -363,11 +417,101 @@ function syncRequestToBudget(r, saveRequest) {
     });
 }
 
+/* ---------- import an Excel workbook into a database-backed department ----------
+   Upserts budget lines by code (keeping existing spend) and brings the Log
+   sheet rows across as ledger entries. Re-importing the same file is safe:
+   each imported row carries a content hash, so duplicates are ignored. */
+function importKeyFor(deptId, code, date, ref, amount, desc) {
+  return crypto.createHash('sha1')
+    .update([deptId, code, String(date), String(ref), Number(amount).toFixed(3), String(desc)].join('|'))
+    .digest('hex');
+}
+
+async function importWorkbookIntoDept(deptId, filePath) {
+  const dept = getDept(deptId);
+  if (!dept) throw new Error('Department not found');
+  const { sheets } = await readWorkbookLocal(filePath);
+  const names = Object.keys(sheets);
+  const pairs = trackerPairs(names);
+  if (!pairs.length) {
+    throw new Error('No "… Tracker" / "… Log" sheet pairs found in that file. Each tracker sheet needs a matching log sheet with the same name ending in "Log".');
+  }
+
+  let linesAdded = 0, linesUpdated = 0, ledgerAdded = 0, ledgerSkipped = 0;
+  const upsertLine = db.prepare(`
+    INSERT INTO budget_lines (id,dept_id,code,description,gl,line_no,budget,adjust,sheet)
+    VALUES (?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(dept_id,code) DO UPDATE SET
+      description=excluded.description, gl=excluded.gl, line_no=excluded.line_no,
+      budget=excluded.budget, adjust=excluded.adjust, sheet=excluded.sheet,
+      updated_at=datetime('now')`);
+
+  const run = db.transaction(() => {
+    for (const pair of pairs) {
+      // ---- budget lines from the tracker sheet
+      const parsed = parseTrackerRows(sheets[pair.trackerSheet], pair.trackerSheet, pair.logSheet, dept, () => 0);
+      for (const l of parsed) {
+        const existing = db.prepare(`SELECT id FROM budget_lines WHERE dept_id=? AND code=?`).get(deptId, l.code);
+        upsertLine.run(
+          existing ? existing.id : 'bln_' + crypto.randomBytes(8).toString('hex'),
+          deptId, l.code, l.description, l.gl, l.line || '', l.budget, l.adjust, pair.trackerSheet
+        );
+        if (existing) linesUpdated++; else linesAdded++;
+      }
+      // ---- spend history from the log sheet
+      const logRows = sheets[pair.logSheet] || [];
+      for (let i = 3; i < logRows.length; i++) {
+        const r = logRows[i] || [];
+        const code = r[3] == null ? '' : String(r[3]).trim();
+        const amount = num(r[5]);
+        if (!code || !amount) continue;
+        const d = r[0] instanceof Date ? r[0].toISOString().slice(0, 10) : String(r[0] == null ? '' : r[0]).slice(0, 30);
+        const ref = r[1] == null ? '' : String(r[1]).trim();
+        const desc = r[2] == null ? '' : String(r[2]).trim();
+        const key = importKeyFor(deptId, code, d, ref, amount, desc);
+        const dup = db.prepare(`SELECT id FROM budget_ledger WHERE import_key=?`).get(key);
+        if (dup) { ledgerSkipped++; continue; }
+        /* don't re-import a row this app itself wrote back to the sheet */
+        if (ref && db.prepare(`SELECT id FROM budget_ledger WHERE request_id=? AND code=? AND dept_id=?`).get(ref, code, deptId)) {
+          ledgerSkipped++; continue;
+        }
+        addLedgerEntry(deptId, {
+          code, date: d, ref, description: desc, amount,
+          remarks: r[7] == null ? '' : String(r[7]).trim(),
+          source: 'import', importKey: key,
+        });
+        ledgerAdded++;
+      }
+    }
+  });
+  run();
+  clearLinesCache(deptId);
+  return { linesAdded, linesUpdated, ledgerAdded, ledgerSkipped, sheets: pairs.length };
+}
+
+/* manual ledger adjustment / correction by an admin */
+function addManualLedgerEntry(deptId, code, amount, description, who) {
+  if (!db.prepare(`SELECT id FROM budget_lines WHERE dept_id=? AND code=?`).get(deptId, code)) {
+    throw new Error('Unknown budget line: ' + code);
+  }
+  return addLedgerEntry(deptId, {
+    code, date: new Date().toISOString().slice(0, 10), ref: 'MANUAL',
+    description: description || 'Manual adjustment', amount: Number(amount),
+    remarks: 'Entered by ' + who, source: 'manual',
+  });
+}
+function ledgerFor(deptId, code) {
+  return code
+    ? db.prepare(`SELECT * FROM budget_ledger WHERE dept_id=? AND code=? ORDER BY entry_date DESC, created_at DESC`).all(deptId, code)
+    : db.prepare(`SELECT * FROM budget_ledger WHERE dept_id=? ORDER BY entry_date DESC, created_at DESC LIMIT 500`).all(deptId);
+}
+
 module.exports = {
   getBudgetConfig, setBudgetConfig, resolveShareLink,
   getDept, getDeptLines, getBudgetLinesForUser, clearLinesCache,
   departmentsForUser, getUserDepartments, setUserDepartments,
   anyDeptOn, budgetLinesOf, appendLogEntries, syncRequestToBudget,
+  importWorkbookIntoDept, addManualLedgerEntry, ledgerFor, dbLinesFor,
   computeHeldAmounts, DEFAULT_BUDGET_CONFIG, graphConfigured,
   newDeptId: () => 'dept_' + Date.now() + '_' + crypto.randomBytes(3).toString('hex'),
 };

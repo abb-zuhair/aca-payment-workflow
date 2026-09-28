@@ -249,6 +249,30 @@ OneDrive and older files from disk transparently. If a OneDrive upload ever
 fails at submit time, the file falls back to local storage and the event is
 logged, so an attachment is never lost.
 
+**Database-backed budgets (recommended).** A department can store its budget
+lines in this system's own database instead of an Excel workbook. Choose
+**Database** as the source when adding a department, then upload your existing
+workbook to populate it. Because nothing is read over the network, the Budget
+tab is instant and can never fail because someone has the spreadsheet open.
+
+- **Importing:** upload an .xlsx with the usual "… Tracker" / "… Log" sheet
+  pairs. Matching codes are **updated** with the new budget and adjustment
+  figures, new codes are **added**, and the Log sheet rows are imported as
+  spend history so Utilized matches what the spreadsheet showed. Existing spend
+  is always kept.
+- **Re-importing is safe.** Every imported row carries a content fingerprint,
+  so uploading the same file again (or an updated version of it) never
+  double-counts. Payments this system recorded itself are never re-imported.
+- **Spend ledger:** each finalized payment writes a ledger row (the database
+  equivalent of a Log sheet line). Utilized is the sum of that ledger, exactly
+  as the workbook's SUMIF did, so the arithmetic matches what finance expects.
+- **Manual adjustments:** an admin can post a correction against any line.
+- Holds, multi-line splits, per-user department access, and the two-phase
+  reserve-then-deduct lifecycle all behave identically to workbook mode.
+
+Database and OneDrive departments **coexist** — each department picks its own
+source, so you can move them across one at a time.
+
 **Multi-department budget integration.** Admin → 💰 Budget lets you register
 **one workbook per department** — IT, HR, Maintenance, and so on — each with
 its own OneDrive link (or a local copy for testing). Every workbook is the

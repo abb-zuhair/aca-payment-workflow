@@ -907,6 +907,60 @@ app.get('/api/files/:id', requireAuth, async (req, res) => {
   }
 });
 
+/* ---------- database-backed budgets: import / ledger ---------- */
+const uploadBudgetFile = multer({
+  storage: multer.diskStorage({
+    destination: path.join(DATA_DIR, 'uploads'),
+    filename: (req, file, cb) => cb(null, 'budgetimport_' + Date.now() + '_' + crypto.randomBytes(4).toString('hex') + '.xlsx'),
+  }),
+  limits: { fileSize: 25 * 1024 * 1024, files: 1 },
+  fileFilter: (req, file, cb) => {
+    const ok = /\.xlsx$/i.test(file.originalname || '') ||
+      file.mimetype === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+    cb(ok ? null : new Error('Please upload an .xlsx file'), ok);
+  },
+});
+
+app.post('/api/budget/departments/:id/import', requireRole('admin'), uploadBudgetFile.single('file'), async (req, res) => {
+  const tmp = req.file && req.file.path;
+  try {
+    const dept = budget.getDept(req.params.id);
+    if (!dept) return res.status(404).json({ error: 'Department not found' });
+    if (dept.mode !== 'db') return res.status(400).json({ error: 'Import is only for database-backed departments. Switch this department to "Database" first.' });
+    if (!tmp) return res.status(400).json({ error: 'No file uploaded' });
+    const result = await budget.importWorkbookIntoDept(dept.id, tmp);
+    audit(null, req.session.user.name,
+      `Imported budget workbook into ${dept.name}: ${result.linesAdded} new lines, ${result.linesUpdated} updated, ${result.ledgerAdded} spend rows added, ${result.ledgerSkipped} already present`);
+    res.json({ result });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  } finally {
+    if (tmp) { try { fs.unlinkSync(tmp); } catch (_) {} }
+  }
+});
+
+app.get('/api/budget/departments/:id/ledger', requireAuth, (req, res) => {
+  const dept = budget.getDept(req.params.id);
+  if (!dept) return res.status(404).json({ error: 'Department not found' });
+  const allowed = budget.departmentsForUser(req.session.user.id, false).some(d => d.id === dept.id);
+  if (!allowed) return res.status(403).json({ error: 'No access to that department' });
+  res.json({ entries: budget.ledgerFor(dept.id, req.query.code || null) });
+});
+
+app.post('/api/budget/departments/:id/ledger', requireRole('admin'), (req, res) => {
+  try {
+    const dept = budget.getDept(req.params.id);
+    if (!dept) return res.status(404).json({ error: 'Department not found' });
+    if (dept.mode !== 'db') return res.status(400).json({ error: 'Manual entries are only for database-backed departments' });
+    const { code, amount, description } = req.body || {};
+    const amt = Number(amount);
+    if (!code || !isFinite(amt) || amt === 0) return res.status(400).json({ error: 'A budget line code and a non-zero amount are required' });
+    budget.addManualLedgerEntry(dept.id, String(code).trim(), amt, String(description || '').slice(0, 200), req.session.user.name);
+    audit(null, req.session.user.name, `Manual budget entry on ${dept.name} / ${code}: ${amt}`);
+    res.json({ ok: true });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
 // ---------- attachment storage (admin) ----------
 app.get('/api/attach-store', requireRole('admin'), (req, res) => {
   res.json({ config: attachStore.getAttachStore(), graphConfigured: attachStore.graphConfigured() });
@@ -1011,7 +1065,7 @@ app.post('/api/budget/departments', requireRole('admin'), async (req, res) => {
     const name = String(body.name || '').trim();
     if (!name) return res.status(400).json({ error: 'Department name is required' });
     const mode = body.mode || 'off';
-    if (!['off', 'local', 'onedrive'].includes(mode)) return res.status(400).json({ error: 'Invalid mode' });
+    if (!['off', 'local', 'onedrive', 'db'].includes(mode)) return res.status(400).json({ error: 'Invalid mode' });
     const dept = {
       id: body.id && cfg.departments.find(d => d.id === body.id) ? body.id : budget.newDeptId(),
       name, mode,

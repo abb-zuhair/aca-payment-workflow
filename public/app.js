@@ -981,6 +981,18 @@ async function adminBudget() {
           <button class="mini-btn del dept-del" data-id="${esc(d.id)}">Remove</button>
         </div>
         ${hasErr ? `<div class="err" style="margin-top:8px;">${esc(lines.error)}</div>` : ''}
+        ${d.mode === 'db' ? `
+        <div style="margin-top:10px;padding:10px 12px;background:var(--paper);border:1px solid var(--line);border-radius:6px;">
+          <div style="font-size:13px;font-weight:600;color:var(--navy-deep);margin-bottom:6px;">Import from Excel</div>
+          <p style="font-size:12.5px;color:var(--ink-soft);margin:0 0 8px;">
+            Upload a workbook with "… Tracker" / "… Log" sheet pairs. Matching codes are updated with the new
+            budget and adjustment figures, new codes are added, and spend rows from the Log sheets are imported.
+            Existing spend is kept, and re-uploading the same file won't double-count.
+          </p>
+          <input type="file" class="dept-import-file" data-id="${esc(d.id)}" accept=".xlsx" style="font-size:12.5px;">
+          <button class="btn outline dept-import-btn" data-id="${esc(d.id)}" style="margin-left:8px;">Import</button>
+          <span class="dept-import-status" data-id="${esc(d.id)}" style="font-size:12.5px;margin-left:8px;"></span>
+        </div>` : ''}
         ${Array.isArray(lines) && lines.length ? `
         <details style="margin-top:8px;"><summary style="cursor:pointer;font-size:13px;color:var(--navy);">View ${lines.length} budget lines</summary>
         <table class="admin-table" style="margin-top:8px;">
@@ -1004,6 +1016,7 @@ async function adminBudget() {
         <div class="field"><label>Department name</label><input id="nd_name" placeholder="e.g. HR"></div>
         <div class="field"><label>Source</label>
           <select id="nd_mode" style="width:100%;padding:9px;border:1px solid var(--line);border-radius:7px;background:#FCFBF7;">
+            <option value="db">Database (recommended — upload Excel to populate)</option>
             <option value="onedrive">OneDrive / SharePoint</option>
             <option value="local">Local file (testing)</option>
           </select>
@@ -1011,6 +1024,7 @@ async function adminBudget() {
       </div>
       <div class="field" id="nd_onedrive"><label>OneDrive share link</label><input id="nd_sharelink" placeholder="https://...sharepoint.com/:x:/g/..."></div>
       <div class="field" id="nd_local" style="display:none;"><label>Local .xlsx path</label><input id="nd_localpath" placeholder="/data/budget/HR.xlsx"></div>
+      <div class="demo-note" id="nd_db" style="margin-bottom:10px;">Budget lines are stored in this system's own database — fast, always available, and never blocked by someone having the Excel file open. After adding the department, upload your existing workbook to populate it.</div>
       <div class="err hidden" id="ndErr" style="margin-bottom:8px;"></div>
       <button class="btn gold" id="addDeptBtn">Add department</button>
     </div>
@@ -1084,6 +1098,7 @@ async function bindBudget() {
   if (ndMode) ndMode.onchange = () => {
     document.getElementById('nd_onedrive').style.display = ndMode.value === 'onedrive' ? 'block' : 'none';
     document.getElementById('nd_local').style.display = ndMode.value === 'local' ? 'block' : 'none';
+    const ndDb = document.getElementById('nd_db'); if (ndDb) ndDb.style.display = ndMode.value === 'db' ? 'block' : 'none';
   };
   const addDept = document.getElementById('addDeptBtn');
   if (addDept) addDept.onclick = async () => {
@@ -1099,6 +1114,26 @@ async function bindBudget() {
       render();
     } catch (e) { errEl.textContent = e.message; errEl.classList.remove('hidden'); addDept.disabled = false; addDept.textContent = 'Add department'; }
   };
+  document.querySelectorAll('.dept-import-btn').forEach(btn => btn.onclick = async () => {
+    const id = btn.dataset.id;
+    const fileInput = document.querySelector('.dept-import-file[data-id="' + id + '"]');
+    const status = document.querySelector('.dept-import-status[data-id="' + id + '"]');
+    if (!fileInput || !fileInput.files.length) { status.textContent = 'Choose an .xlsx file first.'; status.style.color = 'var(--red)'; return; }
+    btn.disabled = true; status.style.color = 'var(--ink-soft)'; status.textContent = 'Importing…';
+    try {
+      const fd = new FormData();
+      fd.append('file', fileInput.files[0]);
+      const res = await fetch('/api/budget/departments/' + id + '/import', { method: 'POST', body: fd, credentials: 'same-origin' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Import failed');
+      const r = data.result;
+      status.style.color = 'var(--green)';
+      status.textContent = `✓ ${r.linesAdded} new lines, ${r.linesUpdated} updated, ${r.ledgerAdded} spend rows added` + (r.ledgerSkipped ? `, ${r.ledgerSkipped} already present` : '');
+      setTimeout(() => render(), 1200);
+    } catch (e) {
+      status.style.color = 'var(--red)'; status.textContent = e.message; btn.disabled = false;
+    }
+  });
   document.querySelectorAll('.dept-del').forEach(b => b.onclick = async () => {
     if (!confirm('Remove this department? Existing requests keep their saved budget info; new requests can no longer pick it.')) return;
     try { await api('/budget/departments/' + b.dataset.id, { method: 'DELETE' }); render(); } catch (e) { alert(e.message); }
