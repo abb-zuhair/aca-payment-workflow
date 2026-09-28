@@ -87,6 +87,9 @@ function cellVal(cell) {
   return v;
 }
 function num(v) { const n = Number(v); return isFinite(n) ? n : 0; }
+/* sub-category = the tracker sheet's name without its "Tracker" suffix,
+   e.g. "ACAH Consumables Tracker" -> "ACAH Consumables" */
+function categoryOf(sheetName) { return String(sheetName || '').replace(/\s*tracker\s*$/i, '').trim() || 'General'; }
 
 /* ---------- backends ---------- */
 async function readWorkbookLocal(localPath) {
@@ -135,7 +138,7 @@ function parseTrackerRows(rows, trackerSheet, logSheet, dept, computeUtilizedFro
       description: r[2] == null ? '' : String(r[2]).trim(),
       gl: r[3] == null ? '' : String(r[3]).trim(),
       budget, utilized, adjust, available,
-      trackerSheet, logSheet,
+      trackerSheet, logSheet, category: categoryOf(trackerSheet),
       deptId: dept.id, deptName: dept.name,
     });
   }
@@ -219,6 +222,7 @@ function dbLinesFor(dept) {
       available: (Number(r.budget) || 0) + (Number(r.adjust) || 0) - utilized,
       trackerSheet: r.sheet || '',
       logSheet: r.sheet || '',
+      category: categoryOf(r.sheet),
       deptId: dept.id, deptName: dept.name,
     };
   });
@@ -227,11 +231,15 @@ function dbLinesFor(dept) {
 /* record a request's split line against a database-backed department */
 function addLedgerEntry(deptId, entry) {
   const id = 'bl_' + Date.now() + '_' + crypto.randomBytes(4).toString('hex');
+  /* every row carries a content fingerprint, so an export → re-import round trip
+     never duplicates it — whether it came from a spreadsheet, a finalized
+     payment, or a manual correction */
+  const key = entry.importKey || importKeyFor(deptId, entry.code, entry.date || '', entry.ref || '', Number(entry.amount) || 0, entry.description || '');
   db.prepare(`INSERT INTO budget_ledger (id,dept_id,code,entry_date,ref,description,amount,remarks,source,request_id,import_key)
               VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
     .run(id, deptId, entry.code, entry.date || '', entry.ref || '', entry.description || '',
          Number(entry.amount) || 0, entry.remarks || '', entry.source || 'app',
-         entry.requestId || null, entry.importKey || null);
+         entry.requestId || null, key);
   return id;
 }
 
@@ -320,7 +328,7 @@ async function getBudgetLinesForUser(userId, force) {
     }
     catch (e) { errors.push({ dept: d.name, error: e.message }); }
   }
-  return { lines, errors, stale: staleDepts, departments: depts.map(d => ({ id: d.id, name: d.name })) };
+  return { lines, errors, stale: staleDepts, departments: depts.map(d => ({ id: d.id, name: d.name, mode: d.mode })) };
 }
 
 /* ---------- append the PRQ log rows (the actual deduction) ---------- */
@@ -489,16 +497,36 @@ async function importWorkbookIntoDept(deptId, filePath) {
   return { linesAdded, linesUpdated, ledgerAdded, ledgerSkipped, sheets: pairs.length };
 }
 
+/* edit a database line's budget / adjustment / description */
+function updateDbLine(deptId, code, fields) {
+  const row = db.prepare(`SELECT * FROM budget_lines WHERE dept_id=? AND code=?`).get(deptId, code);
+  if (!row) throw new Error('Unknown budget line: ' + code);
+  const budgetV = fields.budget !== undefined ? Number(fields.budget) : row.budget;
+  const adjustV = fields.adjust !== undefined ? Number(fields.adjust) : row.adjust;
+  if (!isFinite(budgetV) || !isFinite(adjustV)) throw new Error('Budget and adjustment must be numbers');
+  db.prepare(`UPDATE budget_lines SET budget=?, adjust=?, description=?, updated_at=datetime('now') WHERE id=?`)
+    .run(budgetV, adjustV, fields.description !== undefined ? String(fields.description).slice(0, 200) : row.description, row.id);
+  clearLinesCache(deptId);
+  return db.prepare(`SELECT * FROM budget_lines WHERE id=?`).get(row.id);
+}
+
 /* manual ledger adjustment / correction by an admin */
 function addManualLedgerEntry(deptId, code, amount, description, who) {
   if (!db.prepare(`SELECT id FROM budget_lines WHERE dept_id=? AND code=?`).get(deptId, code)) {
     throw new Error('Unknown budget line: ' + code);
   }
-  return addLedgerEntry(deptId, {
-    code, date: new Date().toISOString().slice(0, 10), ref: 'MANUAL',
-    description: description || 'Manual adjustment', amount: Number(amount),
-    remarks: 'Entered by ' + who, source: 'manual',
-  });
+  try {
+    return addLedgerEntry(deptId, {
+      code, date: new Date().toISOString().slice(0, 10), ref: 'MANUAL',
+      description: description || 'Manual adjustment', amount: Number(amount),
+      remarks: 'Entered by ' + who, source: 'manual',
+    });
+  } catch (e) {
+    if (/UNIQUE constraint failed: budget_ledger.import_key/.test(e.message)) {
+      throw new Error('An identical entry (same line, amount and description) already exists today. If this is intentional, change the description slightly.');
+    }
+    throw e;
+  }
 }
 function ledgerFor(deptId, code) {
   return code
@@ -511,7 +539,7 @@ module.exports = {
   getDept, getDeptLines, getBudgetLinesForUser, clearLinesCache,
   departmentsForUser, getUserDepartments, setUserDepartments,
   anyDeptOn, budgetLinesOf, appendLogEntries, syncRequestToBudget,
-  importWorkbookIntoDept, addManualLedgerEntry, ledgerFor, dbLinesFor,
+  importWorkbookIntoDept, addManualLedgerEntry, ledgerFor, dbLinesFor, updateDbLine, categoryOf,
   computeHeldAmounts, DEFAULT_BUDGET_CONFIG, graphConfigured,
   newDeptId: () => 'dept_' + Date.now() + '_' + crypto.randomBytes(3).toString('hex'),
 };

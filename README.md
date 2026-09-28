@@ -266,7 +266,20 @@ tab is instant and can never fail because someone has the spreadsheet open.
 - **Spend ledger:** each finalized payment writes a ledger row (the database
   equivalent of a Log sheet line). Utilized is the sum of that ledger, exactly
   as the workbook's SUMIF did, so the arithmetic matches what finance expects.
-- **Manual adjustments:** an admin can post a correction against any line.
+- **Sub-categories:** each line is categorised by the tracker sheet it came
+  from (e.g. "ACAH Consumables Tracker" → **ACAH Consumables**). The Budget
+  view groups lines by category with subtotals, and requesters can narrow the
+  line picker by category.
+- **Budget Supervisors can maintain the database** for departments they have
+  access to: import a workbook, edit a line's budget/adjustment/description,
+  and post manual spend corrections. Editing figures never touches recorded
+  spend. Identical same-day manual entries are refused rather than duplicated.
+- **Spend log:** the Log button on any line opens its full history — imported
+  rows, finalized payments (linked to the request), and manual entries.
+- **Export to Excel:** any department can be exported at any time as a
+  Tracker/Log workbook in the same layout the import reads, containing the
+  current figures and the spend log. The export round-trips: it can be edited
+  and re-imported without double-counting.
 - Holds, multi-line splits, per-user department access, and the two-phase
   reserve-then-deduct lifecycle all behave identically to workbook mode.
 

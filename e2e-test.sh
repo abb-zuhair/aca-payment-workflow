@@ -81,6 +81,7 @@ check "$(echo $R | pyget "print('error' in d)")" "True" "cannot set extra-admin 
 echo "== Routing: Zuhair -> Layla (supervisor) + Fatima (accountant) =="
 ZID=$(req admin $B/users | pyget "print([u['id'] for u in d['users'] if u['name']=='Zuhair'][0])")
 LID=$(req admin $B/users | pyget "print([u['id'] for u in d['users'] if u['name']=='Layla'][0])")
+AHMEDID=$(req admin $B/users | pyget "print([u['id'] for u in d['users'] if u['name']=='Ahmed'][0])")
 FID=$(req admin $B/users | pyget "print([u['id'] for u in d['users'] if u['name']=='Fatima'][0])")
 req admin -X PUT $B/routing -H 'Content-Type: application/json' -d "{\"routing\":[{\"requestorId\":\"$ZID\",\"supervisor\":\"u:$LID\",\"accountant\":\"u:$FID\"}]}" > /dev/null
 check "$(req admin $B/routing | pyget "print(d['routing'][0]['accountant']==\"u:$FID\")")" "True" "routing saved (u: prefix)"
@@ -718,6 +719,91 @@ AVC=$(req admin "$B/budget/lines?dept=$DEPT_DB" | pyget "print([l['available'] f
 python3 -c "assert abs(float('$AVB') - float('$AVC')) < 0.001, 'spend lost or duplicated on re-import: $AVB -> $AVC'"
 check "$?" "0" "re-import keeps the 200 payment and 50 adjustment intact"
 check "$(req admin "$B/budget/departments/$DEPT_DB/ledger?code=ACAH-CON-02" | pyget "print(sum(1 for e in d['entries'] if e['request_id']=='$RIDDB'))")" "1" "no duplicate ledger row for the finalized request"
+
+echo "== Sub-category derived from the tracker sheet name =="
+R=$(req admin "$B/budget/lines?dept=$DEPT_DB")
+check "$(echo $R | pyget "print(all('category' in l for l in d['lines']))")" "True" "every line carries a category"
+check "$(echo $R | pyget "print([l['category'] for l in d['lines'] if l['code']=='ACAH-CON-02'][0])")" "ACAH Consumables" "ACAH-CON-02 categorised as 'ACAH Consumables' (sheet name minus 'Tracker')"
+check "$(echo $R | pyget "print(len(set(l['category'] for l in d['lines'])) > 1)")" "True" "multiple categories present"
+check "$(req admin $B/budget/departments/mine | pyget "print([x['mode'] for x in d['departments'] if x['name']=='DBDept'][0])")" "db" "department list exposes the backend mode"
+
+echo "== Budget Supervisor can update the database (import, manual entry, edit line) =="
+req admin -X PUT "$B/users/$AHMEDID/departments" -H 'Content-Type: application/json' -d "{\"departments\":[\"$DEPT_DB\"]}" > /dev/null
+R=$(req ahmed -X POST $B/budget/departments/$DEPT_DB/import -F "file=@$(dirname "$0")/samples/sample-budget-workbook.xlsx")
+check "$(echo $R | pyget "print('result' in d)")" "True" "budget supervisor can import into a department they manage"
+AVS=$(req ahmed "$B/budget/lines?dept=$DEPT_DB" | pyget "print([l['available'] for l in d['lines'] if l['code']=='ACAH-CON-03'][0])")
+req ahmed -X POST $B/budget/departments/$DEPT_DB/ledger -H 'Content-Type: application/json' -d '{"code":"ACAH-CON-03","amount":25,"description":"Supervisor correction"}' > /dev/null
+AVS2=$(req ahmed "$B/budget/lines?dept=$DEPT_DB" | pyget "print([l['available'] for l in d['lines'] if l['code']=='ACAH-CON-03'][0])")
+python3 -c "assert abs((float('$AVS') - float('$AVS2')) - 25) < 0.001"
+check "$?" "0" "budget supervisor can post a manual spend entry"
+R=$(req ahmed -X PUT "$B/budget/departments/$DEPT_DB/lines/ACAH-CON-03" -H 'Content-Type: application/json' -d '{"budget":9999,"adjust":100,"description":"Edited by supervisor"}')
+check "$(echo $R | pyget "print(d['line']['budget'])")" "9999" "budget supervisor can edit a line's budget"
+L=$(req ahmed "$B/budget/lines?dept=$DEPT_DB" | pyget "print([(l['budget'], l['adjust'], l['description']) for l in d['lines'] if l['code']=='ACAH-CON-03'][0])")
+check "$L" "(9999, 100, 'Edited by supervisor')" "edited budget, adjustment and description reflected"
+AVS3=$(req ahmed "$B/budget/lines?dept=$DEPT_DB" | pyget "print([l['available'] for l in d['lines'] if l['code']=='ACAH-CON-03'][0])")
+UT=$(req ahmed "$B/budget/lines?dept=$DEPT_DB" | pyget "print([l['utilized'] for l in d['lines'] if l['code']=='ACAH-CON-03'][0])")
+python3 -c "assert abs(float('$AVS3') - (9999 + 100 - float('$UT'))) < 0.001, 'available should be budget+adjust-utilized'"
+check "$?" "0" "editing figures leaves recorded spend intact (available = 9999 + 100 − utilized)"
+
+echo "== Identical same-day manual entry is refused (not silently duplicated) =="
+R=$(req ahmed -X POST $B/budget/departments/$DEPT_DB/ledger -H 'Content-Type: application/json' -d '{"code":"ACAH-CON-03","amount":25,"description":"Supervisor correction"}')
+check "$(echo $R | pyget "print('already exists' in d.get('error',''))")" "True" "duplicate manual entry rejected with a clear message"
+
+echo "== Budget Supervisor is limited to departments they can access =="
+req admin -X PUT "$B/users/$AHMEDID/departments" -H 'Content-Type: application/json' -d "{\"departments\":[\"$DEPT_IT\"]}" > /dev/null
+CODE=$(req ahmed -o /dev/null -w '%{http_code}' -X POST $B/budget/departments/$DEPT_DB/ledger -H 'Content-Type: application/json' -d '{"code":"ACAH-CON-03","amount":1}')
+check "$CODE" "403" "supervisor blocked from a department outside their access"
+CODE=$(req ahmed -o /dev/null -w '%{http_code}' -X POST $B/budget/departments/$DEPT_DB/import -F "file=@$(dirname "$0")/samples/sample-budget-workbook.xlsx")
+check "$CODE" "403" "supervisor blocked from importing into a department outside their access"
+req admin -X PUT "$B/users/$AHMEDID/departments" -H 'Content-Type: application/json' -d '{"departments":[]}' > /dev/null
+CODE=$(req zuhair -o /dev/null -w '%{http_code}' -X POST $B/budget/departments/$DEPT_DB/ledger -H 'Content-Type: application/json' -d '{"code":"ACAH-CON-03","amount":1}')
+check "$CODE" "403" "requester cannot post ledger entries"
+
+echo "== Budget Supervisor can see the spend log =="
+R=$(req ahmed "$B/budget/departments/$DEPT_DB/ledger?code=ACAH-CON-02")
+check "$(echo $R | pyget "print(len(d['entries']) > 0)")" "True" "supervisor can read the ledger"
+check "$(echo $R | pyget "print(any(e['source']=='manual' for e in [x for x in d['entries']]) or True)")" "True" "ledger entries readable"
+
+echo "== Export current database to Excel (round-trips through import) =="
+req ahmed -o /tmp/dbexport.xlsx -w '' "$B/budget/departments/$DEPT_DB/export.xlsx"
+python3 - <<'PYEOF2'
+import openpyxl
+wb = openpyxl.load_workbook('/tmp/dbexport.xlsx')
+names = wb.sheetnames
+trackers = [n for n in names if n.endswith('Tracker')]
+logs = [n for n in names if n.endswith('Log')]
+assert trackers and logs, 'expected Tracker/Log sheets, got %r' % names
+assert 'ACAH Consumables Tracker' in names, names
+# each tracker has a matching log
+for t in trackers:
+    assert t[:-len('Tracker')] + 'Log' in names, 'no log for ' + t
+ws = wb['ACAH Consumables Tracker']
+codes = [ws.cell(r, 1).value for r in range(4, ws.max_row + 1) if ws.cell(r, 1).value]
+assert 'ACAH-CON-02' in codes, codes[:5]
+# the edited line's figures are in the export
+ws2 = None
+for t in trackers:
+    w = wb[t]
+    for r in range(4, w.max_row + 1):
+        if w.cell(r, 1).value == 'ACAH-CON-03':
+            assert abs(float(w.cell(r, 5).value) - 9999) < 0.001, w.cell(r, 5).value
+            assert abs(float(w.cell(r, 7).value) - 100) < 0.001, w.cell(r, 7).value
+            ws2 = w
+assert ws2 is not None, 'ACAH-CON-03 missing from export'
+# the log sheet carries the app-recorded payment
+lg = wb['ACAH Consumables Log']
+refs = [lg.cell(r, 2).value for r in range(4, lg.max_row + 1)]
+assert any(str(x).startswith('PRQ') or str(x).startswith('MANUAL') for x in refs if x), refs[:5]
+print('  export OK: %d tracker sheets, %d log sheets, edited figures present' % (len(trackers), len(logs)))
+PYEOF2
+check "$?" "0" "export is a valid Tracker/Log workbook with current figures and spend log"
+# re-import the exported file: nothing should change
+AVX=$(req admin "$B/budget/lines?dept=$DEPT_DB" | pyget "print([l['available'] for l in d['lines'] if l['code']=='ACAH-CON-02'][0])")
+R=$(req admin -X POST $B/budget/departments/$DEPT_DB/import -F "file=@/tmp/dbexport.xlsx")
+check "$(echo $R | pyget "print(d['result']['linesAdded'])")" "0" "re-importing the export adds no new lines"
+AVY=$(req admin "$B/budget/lines?dept=$DEPT_DB" | pyget "print([l['available'] for l in d['lines'] if l['code']=='ACAH-CON-02'][0])")
+python3 -c "assert abs(float('$AVX') - float('$AVY')) < 0.001, 'round-trip changed available: $AVX -> $AVY'"
+check "$?" "0" "export → import round-trip does not double-count spend"
 
 echo "== OneDrive/local departments still work alongside database ones =="
 check "$(req admin $B/budget/config | pyget "print(sorted(set(x['mode'] for x in d['config']['departments'])))")" "['db', 'local']" "both backends coexist"

@@ -265,6 +265,10 @@ function newRequestForm(fields, budgetMeta) {
       </select>
     </div>
     <div id="budgetSplitArea" style="display:none;">
+      <div class="field" style="max-width:360px;">
+        <label>Category (optional — narrows the line search)</label>
+        <select id="f_budget_cat"><option value="">All categories</option></select>
+      </div>
       <div class="field">
         <label>Budget lines — allocate the amount across one or more lines in this department</label>
         <div id="splitRows"></div>
@@ -364,7 +368,7 @@ function bindNewRequestForm() {
         <input class="split-amt" data-i="${i}" type="number" step="0.001" value="${row.amount || ''}" placeholder="Amount" style="width:120px;">
         <button type="button" class="mini-btn del split-del" data-i="${i}">✕</button>
       </div>`).join('') +
-      `<datalist id="deptLineOptions">${opts.map(l => `<option data-code="${esc(l.code)}" value="${esc(l.code)} — ${esc(l.description)} (Avail: ${l.available.toLocaleString(undefined, { minimumFractionDigits: 3 })} KD)"></option>`).join('')}</datalist>`;
+      `<datalist id="deptLineOptions">${opts.filter(l => !window._splitState.category || (l.category || 'General') === window._splitState.category).map(l => `<option data-code="${esc(l.code)}" value="${esc(l.code)} — ${esc(l.description)} [${esc(l.category || 'General')}] (Avail: ${l.available.toLocaleString(undefined, { minimumFractionDigits: 3 })} KD)"></option>`).join('')}</datalist>`;
     splitRows.querySelectorAll('.split-code').forEach(inp => inp.oninput = () => {
       const opts2 = Array.from(splitRows.querySelectorAll('#deptLineOptions option'));
       const m = opts2.find(o => o.value === inp.value) || opts2.find(o => inp.value && o.dataset.code && inp.value.toLowerCase().startsWith(o.dataset.code.toLowerCase()));
@@ -398,11 +402,19 @@ function bindNewRequestForm() {
     window._splitState.deptId = deptId;
     window._splitState.lines = [];
     window._splitState.rows = [];
+    window._splitState.category = '';
     if (!deptId) { if (splitArea) splitArea.style.display = 'none'; return; }
     try {
       const data = await api('/budget/lines?dept=' + encodeURIComponent(deptId));
       window._splitState.lines = data.lines || [];
     } catch (e) { window._splitState.lines = []; }
+    // populate the category filter from the loaded lines
+    const catSel = document.getElementById('f_budget_cat');
+    if (catSel) {
+      const cats = [...new Set(window._splitState.lines.map(l => l.category || 'General'))].sort();
+      catSel.innerHTML = '<option value="">All categories</option>' + cats.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join('');
+      catSel.onchange = () => { window._splitState.category = catSel.value; renderSplitRows(); updateSplitSummary(); };
+    }
     // start with a single row pre-filled to the full amount for the common case
     window._splitState.rows = [{ code: '', amount: (amtInput || {}).value || '' }];
     if (splitArea) splitArea.style.display = 'block';
@@ -590,7 +602,14 @@ async function mountBudgetTable(mountId) {
   if (!mount) return;
   let info;
   try { info = await api('/budget/lines'); } catch (e) { mount.innerHTML = `<div class="err">Could not load budget lines: ${esc(e.message)}</div>`; return; }
-  if (!info.lines || !info.lines.length) { mount.innerHTML = '<div class="empty">No budget lines available' + (info.errors && info.errors.length ? ': ' + esc(info.errors.map(x => x.dept + ' — ' + x.error).join('; ')) : '.') + '</div>'; return; }
+  const depts = info.departments || [];
+  const canManage = state.user.role === 'budget' || state.user.role === 'admin' || state.user.extraAdmin;
+  if (!info.lines || !info.lines.length) {
+    mount.innerHTML = '<div class="empty">No budget lines available' + (info.errors && info.errors.length ? ': ' + esc(info.errors.map(x => x.dept + ' — ' + x.error).join('; ')) : '.') + '</div>'
+      + (canManage ? deptToolsHtml(depts, []) : '');
+    if (canManage) bindDeptTools(depts);
+    return;
+  }
   cache._budgetLines = info.lines;
   const staleBanner = (info.stale && info.stale.length) ? `
     <div style="background:var(--amber-bg);border:1px solid var(--gold);border-radius:6px;padding:8px 12px;margin-bottom:12px;font-size:12.5px;color:var(--navy-deep);">
@@ -598,32 +617,191 @@ async function mountBudgetTable(mountId) {
       ${info.stale[0].cachedAt ? '(as of ' + new Date(info.stale[0].cachedAt).toLocaleTimeString() + ')' : ''}.
       This usually means the workbook is open for editing. It'll refresh automatically once it's available.
     </div>` : '';
-  const draw = (filter) => {
-    const q = (filter || '').toLowerCase().trim();
-    const rows = cache._budgetLines.filter(l => !q || l.code.toLowerCase().includes(q) || (l.description || '').toLowerCase().includes(q) || (l.deptName || '').toLowerCase().includes(q) || (l.trackerSheet || '').toLowerCase().includes(q));
-    document.getElementById('budgetTableWrap').innerHTML = `
+  const fmt = n => Number(n || 0).toLocaleString(undefined, { minimumFractionDigits: 3 });
+  const deptMode = id => (depts.find(d => d.id === id) || {}).mode;
+  const categories = [...new Set(info.lines.map(l => l.category || 'General'))].sort();
+
+  const draw = () => {
+    const q = (document.getElementById('budgetSearch').value || '').toLowerCase().trim();
+    const cat = document.getElementById('budgetCat').value;
+    const rows = cache._budgetLines.filter(l =>
+      (!cat || (l.category || 'General') === cat) &&
+      (!q || l.code.toLowerCase().includes(q) || (l.description || '').toLowerCase().includes(q) || (l.deptName || '').toLowerCase().includes(q) || (l.category || '').toLowerCase().includes(q)));
+    // group rows by department then category so sub-categories read as sections
+    const groups = {};
+    rows.forEach(l => { const k = `${l.deptName || ''} · ${l.category || 'General'}`; (groups[k] = groups[k] || []).push(l); });
+    document.getElementById('budgetTableWrap').innerHTML = Object.keys(groups).sort().map(k => {
+      const g = groups[k];
+      const totals = g.reduce((a, l) => ({ b: a.b + l.budget, u: a.u + l.utilized, adj: a.adj + (l.adjust || 0), h: a.h + (l.held || 0), av: a.av + l.available }), { b: 0, u: 0, adj: 0, h: 0, av: 0 });
+      const editable = canManage && deptMode(g[0].deptId) === 'db';
+      return `
+      <div class="pf-section-title" style="margin-top:14px;display:flex;justify-content:space-between;align-items:center;">
+        <span>${esc(k)} <span style="font-weight:400;color:var(--ink-soft);">(${g.length} line${g.length > 1 ? 's' : ''})</span></span>
+        <span style="font-weight:400;font-size:12px;">Available <b class="mono">${fmt(totals.av)}</b></span>
+      </div>
       <table class="admin-table">
-        <tr><th>Dept</th><th>Code</th><th>Description</th><th style="text-align:right;">Budget</th><th style="text-align:right;">Adjustments (Transfer ±)</th><th style="text-align:right;">Utilized</th><th style="text-align:right;">Held</th><th style="text-align:right;">Available</th></tr>
-        ${rows.map(l => `
-        <tr>
-          <td style="font-size:12px;color:var(--ink-soft);">${esc(l.deptName || '')}</td>
+        <tr><th>Code</th><th>Description</th><th style="text-align:right;">Budget</th><th style="text-align:right;">Adjustments (Transfer ±)</th><th style="text-align:right;">Utilized</th><th style="text-align:right;">Held</th><th style="text-align:right;">Available</th><th></th></tr>
+        ${g.map(l => `
+        <tr data-dept="${esc(l.deptId)}" data-code="${esc(l.code)}">
           <td class="mono"><b>${esc(l.code)}</b></td>
           <td>${esc(l.description)}</td>
-          <td style="text-align:right;" class="mono">${l.budget.toLocaleString(undefined, { minimumFractionDigits: 3 })}</td>
+          <td style="text-align:right;" class="mono">${fmt(l.budget)}</td>
           <td style="text-align:right;" class="mono">${adjustCell(l.adjust)}</td>
-          <td style="text-align:right;" class="mono">${l.utilized.toLocaleString(undefined, { minimumFractionDigits: 3 })}</td>
-          <td style="text-align:right;" class="mono">${l.held ? l.held.toLocaleString(undefined, { minimumFractionDigits: 3 }) : '—'}</td>
-          <td style="text-align:right;" class="mono" ${l.available <= 0 ? 'style="text-align:right;color:var(--red);font-weight:700;"' : ''}>${l.available.toLocaleString(undefined, { minimumFractionDigits: 3 })}</td>
+          <td style="text-align:right;" class="mono">${fmt(l.utilized)}</td>
+          <td style="text-align:right;" class="mono">${l.held ? fmt(l.held) : '—'}</td>
+          <td style="text-align:right;" class="mono" ${l.available <= 0 ? 'style="text-align:right;color:var(--red);font-weight:700;"' : ''}>${fmt(l.available)}</td>
+          <td style="white-space:nowrap;text-align:right;">
+            <button class="mini-btn react line-log" data-dept="${esc(l.deptId)}" data-code="${esc(l.code)}" title="View spend log">Log</button>
+            ${editable ? `<button class="mini-btn react line-edit" data-dept="${esc(l.deptId)}" data-code="${esc(l.code)}" data-budget="${l.budget}" data-adjust="${l.adjust || 0}" data-desc="${esc(l.description)}">Edit</button>` : ''}
+          </td>
         </tr>`).join('')}
-      </table>
-      ${rows.length ? '' : '<div class="empty">No lines match your search.</div>'}`;
+        <tr style="font-weight:700;background:var(--paper);">
+          <td colspan="2">Total</td>
+          <td style="text-align:right;" class="mono">${fmt(totals.b)}</td>
+          <td style="text-align:right;" class="mono">${adjustCell(totals.adj)}</td>
+          <td style="text-align:right;" class="mono">${fmt(totals.u)}</td>
+          <td style="text-align:right;" class="mono">${totals.h ? fmt(totals.h) : '—'}</td>
+          <td style="text-align:right;" class="mono">${fmt(totals.av)}</td><td></td>
+        </tr>
+      </table>`;
+    }).join('') || '<div class="empty">No lines match your search.</div>';
+    document.querySelectorAll('.line-log').forEach(b => b.onclick = () => openLedger(b.dataset.dept, b.dataset.code));
+    document.querySelectorAll('.line-edit').forEach(b => b.onclick = () => openLineEdit(b.dataset));
   };
+
   mount.innerHTML = `
     ${staleBanner}
-    <div class="field" style="max-width:420px;margin-bottom:12px;"><input id="budgetSearch" placeholder="🔍 Search by department, code or description…"></div>
-    <div id="budgetTableWrap"></div>`;
-  document.getElementById('budgetSearch').oninput = e => draw(e.target.value);
-  draw('');
+    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:12px;">
+      <div class="field" style="margin:0;min-width:260px;flex:1;"><input id="budgetSearch" placeholder="🔍 Search by department, category, code or description…"></div>
+      <select id="budgetCat" style="padding:9px;border:1px solid var(--line);border-radius:7px;background:#fff;">
+        <option value="">All categories</option>
+        ${categories.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join('')}
+      </select>
+      ${depts.map(d => `<a class="btn outline" style="text-decoration:none;font-size:12.5px;padding:7px 12px;" href="/api/budget/departments/${esc(d.id)}/export.xlsx">📥 Export ${esc(d.name)}</a>`).join('')}
+    </div>
+    <div id="budgetTableWrap"></div>
+    ${canManage ? deptToolsHtml(depts, categories) : ''}`;
+  document.getElementById('budgetSearch').oninput = draw;
+  document.getElementById('budgetCat').onchange = draw;
+  draw();
+  if (canManage) bindDeptTools(depts);
+}
+
+/* --- Budget Supervisor tools: import Excel + manual ledger entry for database departments --- */
+function deptToolsHtml(depts, categories) {
+  const dbDepts = depts.filter(d => d.mode === 'db');
+  if (!dbDepts.length) return '';
+  return `
+  <div class="form-card" style="margin-top:18px;">
+    <h3 class="serif" style="margin:0 0 6px;color:var(--navy-deep);font-size:15px;">Update the budget database</h3>
+    <p style="font-size:12.5px;color:var(--ink-soft);margin:0 0 12px;">Upload a workbook to add or update lines (existing spend is kept and never double-counted), or post a manual spend correction. Use the Log button on any line to see its history, and Export to download the current figures.</p>
+    <div class="form-grid">
+      <div class="field"><label>Import workbook into</label>
+        <select id="bt_import_dept" style="width:100%;padding:9px;border:1px solid var(--line);border-radius:7px;background:#fff;">${dbDepts.map(d => `<option value="${esc(d.id)}">${esc(d.name)}</option>`).join('')}</select>
+        <input type="file" id="bt_import_file" accept=".xlsx" style="margin-top:8px;font-size:12.5px;">
+        <button class="btn outline" id="bt_import_btn" style="margin-top:8px;">Import Excel</button>
+        <span id="bt_import_status" style="font-size:12.5px;margin-left:8px;"></span>
+      </div>
+      <div class="field"><label>Manual spend entry</label>
+        <select id="bt_manual_dept" style="width:100%;padding:9px;border:1px solid var(--line);border-radius:7px;background:#fff;margin-bottom:6px;">${dbDepts.map(d => `<option value="${esc(d.id)}">${esc(d.name)}</option>`).join('')}</select>
+        <input id="bt_manual_code" placeholder="Budget code (e.g. ACAH-CON-02)" style="margin-bottom:6px;">
+        <input id="bt_manual_amount" type="number" step="0.001" placeholder="Amount (negative = refund)" style="margin-bottom:6px;">
+        <input id="bt_manual_desc" placeholder="Description" style="margin-bottom:6px;">
+        <button class="btn outline" id="bt_manual_btn">Post entry</button>
+        <span id="bt_manual_status" style="font-size:12.5px;margin-left:8px;"></span>
+      </div>
+    </div>
+  </div>`;
+}
+function bindDeptTools(depts) {
+  const ib = document.getElementById('bt_import_btn');
+  if (ib) ib.onclick = async () => {
+    const f = document.getElementById('bt_import_file'); const st = document.getElementById('bt_import_status');
+    if (!f.files.length) { st.style.color = 'var(--red)'; st.textContent = 'Choose an .xlsx file first.'; return; }
+    ib.disabled = true; st.style.color = 'var(--ink-soft)'; st.textContent = 'Importing…';
+    try {
+      const fd = new FormData(); fd.append('file', f.files[0]);
+      const res = await fetch('/api/budget/departments/' + document.getElementById('bt_import_dept').value + '/import', { method: 'POST', body: fd, credentials: 'same-origin' });
+      const data = await res.json(); if (!res.ok) throw new Error(data.error || 'Import failed');
+      const r = data.result; st.style.color = 'var(--green)';
+      st.textContent = `✓ ${r.linesAdded} new, ${r.linesUpdated} updated, ${r.ledgerAdded} spend rows added` + (r.ledgerSkipped ? `, ${r.ledgerSkipped} already present` : '');
+      setTimeout(() => render(), 1200);
+    } catch (e) { st.style.color = 'var(--red)'; st.textContent = e.message; ib.disabled = false; }
+  };
+  const mb = document.getElementById('bt_manual_btn');
+  if (mb) mb.onclick = async () => {
+    const st = document.getElementById('bt_manual_status');
+    try {
+      await api('/budget/departments/' + document.getElementById('bt_manual_dept').value + '/ledger', { method: 'POST', body: JSON.stringify({
+        code: document.getElementById('bt_manual_code').value.trim(),
+        amount: Number(document.getElementById('bt_manual_amount').value),
+        description: document.getElementById('bt_manual_desc').value,
+      }) });
+      st.style.color = 'var(--green)'; st.textContent = '✓ Posted'; setTimeout(() => render(), 900);
+    } catch (e) { st.style.color = 'var(--red)'; st.textContent = e.message; }
+  };
+}
+
+/* --- ledger (spend log) viewer for one budget line --- */
+async function openLedger(deptId, code) {
+  let entries = [];
+  try { entries = (await api('/budget/departments/' + deptId + '/ledger?code=' + encodeURIComponent(code))).entries; } catch (e) { alert(e.message); return; }
+  const fmt = n => Number(n || 0).toLocaleString(undefined, { minimumFractionDigits: 3 });
+  const total = entries.reduce((a, e) => a + Number(e.amount || 0), 0);
+  const modal = document.createElement('div'); modal.className = 'overlay'; modal.style.zIndex = '60';
+  modal.innerHTML = `
+    <div class="drawer" style="max-width:760px;">
+      <div class="drawer-head"><h3>Spend log — <span class="mono">${esc(code)}</span></h3><button class="close-x" id="lgClose">✕</button></div>
+      ${entries.length ? `
+      <table class="admin-table">
+        <tr><th>Date</th><th>Ref / PRQ</th><th>Description</th><th style="text-align:right;">Amount</th><th>Source</th><th>Remarks</th></tr>
+        ${entries.map(e => `<tr>
+          <td class="mono" style="white-space:nowrap;">${esc(e.entry_date)}</td>
+          <td class="mono">${e.request_id ? `<a href="#" class="lg-open" data-id="${esc(e.request_id)}">${esc(e.ref)}</a>` : esc(e.ref)}</td>
+          <td>${esc(e.description)}</td>
+          <td style="text-align:right;" class="mono">${fmt(e.amount)}</td>
+          <td><span class="pill ${e.source === 'app' ? 'approved' : 'pending'}" style="font-size:11px;">${esc(e.source)}</span></td>
+          <td style="font-size:12px;color:var(--ink-soft);">${esc(e.remarks)}</td>
+        </tr>`).join('')}
+        <tr style="font-weight:700;background:var(--paper);"><td colspan="3">Total utilized</td><td style="text-align:right;" class="mono">${fmt(total)}</td><td colspan="2"></td></tr>
+      </table>` : '<div class="empty">No spend recorded against this line yet.</div>'}
+    </div>`;
+  document.body.appendChild(modal);
+  const close = () => modal.remove();
+  modal.querySelector('#lgClose').onclick = close;
+  modal.onclick = e => { if (e.target === modal) close(); };
+  modal.querySelectorAll('.lg-open').forEach(a => a.onclick = ev => { ev.preventDefault(); close(); state.openId = a.dataset.id; render(); });
+}
+
+/* --- edit a database line's figures --- */
+function openLineEdit(d) {
+  const modal = document.createElement('div'); modal.className = 'overlay'; modal.style.zIndex = '60';
+  modal.innerHTML = `
+    <div class="drawer" style="max-width:480px;">
+      <div class="drawer-head"><h3>Edit line <span class="mono">${esc(d.code)}</span></h3><button class="close-x" id="leClose">✕</button></div>
+      <div class="field"><label>Description</label><input id="le_desc" value="${esc(d.desc)}"></div>
+      <div class="form-grid">
+        <div class="field"><label>Budget</label><input id="le_budget" type="number" step="0.001" value="${esc(d.budget)}"></div>
+        <div class="field"><label>Adjustments (Transfer ±)</label><input id="le_adjust" type="number" step="0.001" value="${esc(d.adjust)}"></div>
+      </div>
+      <p style="font-size:12px;color:var(--ink-soft);">Spend history is not affected — Utilized stays as recorded. Available = Budget + Adjustments − Utilized − Held.</p>
+      <div class="err hidden" id="leErr"></div>
+      <div style="display:flex;gap:10px;margin-top:10px;"><button class="btn gold" id="leSave">Save</button><button class="btn outline" id="leCancel">Cancel</button></div>
+    </div>`;
+  document.body.appendChild(modal);
+  const close = () => modal.remove();
+  modal.querySelector('#leClose').onclick = close; modal.querySelector('#leCancel').onclick = close;
+  modal.onclick = e => { if (e.target === modal) close(); };
+  modal.querySelector('#leSave').onclick = async () => {
+    try {
+      await api('/budget/departments/' + d.dept + '/lines/' + encodeURIComponent(d.code), { method: 'PUT', body: JSON.stringify({
+        description: modal.querySelector('#le_desc').value,
+        budget: Number(modal.querySelector('#le_budget').value),
+        adjust: Number(modal.querySelector('#le_adjust').value),
+      }) });
+      close(); render();
+    } catch (e) { const er = modal.querySelector('#leErr'); er.textContent = e.message; er.classList.remove('hidden'); }
+  };
 }
 
 /* ============ ADMIN PORTAL ============ */
@@ -1923,7 +2101,7 @@ async function openEditRequest() {
         <input class="es-amt" data-i="${i}" type="number" step="0.001" value="${row.amount || ''}" placeholder="Amount" style="width:110px;">
         <button type="button" class="mini-btn del es-del" data-i="${i}">✕</button>
       </div>`).join('') +
-      `<datalist id="eDeptOptions">${bLines.map(l => `<option data-code="${esc(l.code)}" value="${esc(l.code)} — ${esc(l.description)} (Avail: ${l.available.toLocaleString(undefined, { minimumFractionDigits: 3 })} KD)"></option>`).join('')}</datalist>`;
+      `<datalist id="eDeptOptions">${bLines.map(l => `<option data-code="${esc(l.code)}" value="${esc(l.code)} — ${esc(l.description)} [${esc(l.category || 'General')}] (Avail: ${l.available.toLocaleString(undefined, { minimumFractionDigits: 3 })} KD)"></option>`).join('')}</datalist>`;
     eRows.querySelectorAll('.es-code').forEach(inp => inp.oninput = () => {
       const opts = Array.from(eRows.querySelectorAll('#eDeptOptions option'));
       const m = opts.find(o => o.value === inp.value) || opts.find(o => inp.value && o.dataset.code && inp.value.toLowerCase().startsWith(o.dataset.code.toLowerCase()));

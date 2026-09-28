@@ -908,6 +908,10 @@ app.get('/api/files/:id', requireAuth, async (req, res) => {
 });
 
 /* ---------- database-backed budgets: import / ledger ---------- */
+function canManageDept(req, dept) {
+  if (effectiveRoles(req.session.user).includes('admin')) return true;
+  return budget.departmentsForUser(req.session.user.id, false).some(d => d.id === dept.id);
+}
 const uploadBudgetFile = multer({
   storage: multer.diskStorage({
     destination: path.join(DATA_DIR, 'uploads'),
@@ -921,11 +925,12 @@ const uploadBudgetFile = multer({
   },
 });
 
-app.post('/api/budget/departments/:id/import', requireRole('admin'), uploadBudgetFile.single('file'), async (req, res) => {
+app.post('/api/budget/departments/:id/import', requireRole('admin', 'budget'), uploadBudgetFile.single('file'), async (req, res) => {
   const tmp = req.file && req.file.path;
   try {
     const dept = budget.getDept(req.params.id);
     if (!dept) return res.status(404).json({ error: 'Department not found' });
+    if (!canManageDept(req, dept)) return res.status(403).json({ error: 'No access to that department' });
     if (dept.mode !== 'db') return res.status(400).json({ error: 'Import is only for database-backed departments. Switch this department to "Database" first.' });
     if (!tmp) return res.status(400).json({ error: 'No file uploaded' });
     const result = await budget.importWorkbookIntoDept(dept.id, tmp);
@@ -947,10 +952,11 @@ app.get('/api/budget/departments/:id/ledger', requireAuth, (req, res) => {
   res.json({ entries: budget.ledgerFor(dept.id, req.query.code || null) });
 });
 
-app.post('/api/budget/departments/:id/ledger', requireRole('admin'), (req, res) => {
+app.post('/api/budget/departments/:id/ledger', requireRole('admin', 'budget'), (req, res) => {
   try {
     const dept = budget.getDept(req.params.id);
     if (!dept) return res.status(404).json({ error: 'Department not found' });
+    if (!canManageDept(req, dept)) return res.status(403).json({ error: 'No access to that department' });
     if (dept.mode !== 'db') return res.status(400).json({ error: 'Manual entries are only for database-backed departments' });
     const { code, amount, description } = req.body || {};
     const amt = Number(amount);
@@ -959,6 +965,91 @@ app.post('/api/budget/departments/:id/ledger', requireRole('admin'), (req, res) 
     audit(null, req.session.user.name, `Manual budget entry on ${dept.name} / ${code}: ${amt}`);
     res.json({ ok: true });
   } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+app.put('/api/budget/departments/:id/lines/:code', requireRole('admin', 'budget'), (req, res) => {
+  try {
+    const dept = budget.getDept(req.params.id);
+    if (!dept) return res.status(404).json({ error: 'Department not found' });
+    if (!canManageDept(req, dept)) return res.status(403).json({ error: 'No access to that department' });
+    if (dept.mode !== 'db') return res.status(400).json({ error: 'Only database-backed lines can be edited here' });
+    const code = decodeURIComponent(req.params.code);
+    const b = req.body || {};
+    const row = budget.updateDbLine(dept.id, code, { budget: b.budget, adjust: b.adjust, description: b.description });
+    audit(null, req.session.user.name, `Edited budget line ${dept.name} / ${code}: budget ${row.budget}, adjust ${row.adjust}`);
+    res.json({ line: row });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+/* export a department's current database as an Excel workbook, in the same
+   Tracker/Log layout the import reads — so the file can be edited and re-imported */
+app.get('/api/budget/departments/:id/export.xlsx', requireAuth, async (req, res) => {
+  try {
+    const dept = budget.getDept(req.params.id);
+    if (!dept) return res.status(404).json({ error: 'Department not found' });
+    const allowed = budget.departmentsForUser(req.session.user.id, false).some(d => d.id === dept.id);
+    if (!allowed) return res.status(403).json({ error: 'No access to that department' });
+    const data = await budget.getDeptLines(dept.id, false);
+    const wb = new ExcelJS.Workbook();
+    wb.creator = 'ACA Payment Workflow';
+    const hdrFill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1D4A94' } };
+    const hdrFont = { bold: true, color: { argb: 'FFFFFFFF' } };
+    const money = '#,##0.000';
+
+    // group lines by category (= tracker sheet name), one Tracker/Log pair each
+    const groups = {};
+    for (const l of data.lines) (groups[l.category || 'General'] = groups[l.category || 'General'] || []).push(l);
+    const safeName = n => String(n).replace(/[\[\]\*\?\/\\:]/g, ' ').slice(0, 24);
+
+    for (const cat of Object.keys(groups).sort()) {
+      const lines = groups[cat];
+      const t = wb.addWorksheet(`${safeName(cat)} Tracker`);
+      t.getCell('A1').value = `${dept.name} — ${cat}`; t.getCell('A1').font = { bold: true, size: 13 };
+      t.getCell('A2').value = 'Exported ' + new Date().toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
+      const th = t.getRow(3);
+      th.values = ['Unique Code', 'Line', 'Description', 'GL', 'Budget', 'Utilized', 'Adjustments (Transfer ±)', 'Available', 'Held (pending)'];
+      th.eachCell(c => { c.fill = hdrFill; c.font = hdrFont; });
+      let r = 4;
+      for (const l of lines) {
+        const row = t.getRow(r);
+        row.values = [l.code, l.line, l.description, l.gl, l.budget, l.utilized, l.adjust, l.rawAvailable != null ? l.rawAvailable : l.available, l.held || 0];
+        [5, 6, 7, 8, 9].forEach(i => row.getCell(i).numFmt = money);
+        r++;
+      }
+      t.columns = [{ width: 16 }, { width: 8 }, { width: 44 }, { width: 12 }, { width: 14 }, { width: 14 }, { width: 18 }, { width: 14 }, { width: 14 }];
+      t.views = [{ state: 'frozen', ySplit: 3 }];
+
+      const lg = wb.addWorksheet(`${safeName(cat)} Log`);
+      lg.getCell('A1').value = `${dept.name} — ${cat} — spend log`; lg.getCell('A1').font = { bold: true, size: 13 };
+      const lh = lg.getRow(3);
+      lh.values = ['Date', 'Ref / PRQ No.', 'Description / Vendor', 'Unique Code', '', 'Amount', '', 'Remarks'];
+      lh.eachCell(c => { if (c.value) { c.fill = hdrFill; c.font = hdrFont; } });
+      let lr = 4;
+      if (dept.mode === 'db') {
+        const codes = new Set(lines.map(l => l.code));
+        const entries = budget.ledgerFor(dept.id, null).filter(e => codes.has(e.code))
+          .sort((a, b) => (a.entry_date || '').localeCompare(b.entry_date || ''));
+        for (const e of entries) {
+          const row = lg.getRow(lr);
+          row.values = [e.entry_date, e.ref, e.description, e.code, '', e.amount, '', e.remarks + (e.source === 'app' ? '' : ` [${e.source}]`)];
+          row.getCell(6).numFmt = money;
+          lr++;
+        }
+      } else {
+        lg.getCell('A4').value = '(Spend history is held in the linked OneDrive workbook for this department)';
+      }
+      lg.columns = [{ width: 12 }, { width: 18 }, { width: 44 }, { width: 16 }, { width: 4 }, { width: 14 }, { width: 4 }, { width: 28 }];
+      lg.views = [{ state: 'frozen', ySplit: 3 }];
+    }
+    if (!Object.keys(groups).length) wb.addWorksheet('Empty').getCell('A1').value = 'No budget lines yet';
+
+    audit(null, req.session.user.name, `Exported ${dept.name} budget to Excel`);
+    const stamp = new Date().toISOString().slice(0, 10);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${dept.name.replace(/[^\w\-]+/g, '_')}_budget_${stamp}.xlsx"`);
+    await wb.xlsx.write(res);
+    res.end();
+  } catch (e) { if (!res.headersSent) res.status(500).json({ error: e.message }); }
 });
 
 // ---------- attachment storage (admin) ----------
@@ -1106,7 +1197,7 @@ app.delete('/api/budget/departments/:id', requireRole('admin'), (req, res) => {
 app.get('/api/budget/departments/mine', requireAuth, (req, res) => {
   const depts = budget.departmentsForUser(req.session.user.id, false);
   const cfg = budget.getBudgetConfig();
-  res.json({ departments: depts.map(d => ({ id: d.id, name: d.name })), required: cfg.required, policy: cfg.policy });
+  res.json({ departments: depts.map(d => ({ id: d.id, name: d.name, mode: d.mode })), required: cfg.required, policy: cfg.policy });
 });
 app.get('/api/budget/lines', requireAuth, async (req, res) => {
   try {
