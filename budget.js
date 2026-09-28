@@ -511,15 +511,21 @@ function updateDbLine(deptId, code, fields) {
 }
 
 /* manual ledger adjustment / correction by an admin */
-function addManualLedgerEntry(deptId, code, amount, description, who) {
+function addManualLedgerEntry(deptId, code, amount, description, who, opts = {}) {
   if (!db.prepare(`SELECT id FROM budget_lines WHERE dept_id=? AND code=?`).get(deptId, code)) {
     throw new Error('Unknown budget line: ' + code);
   }
+  /* a full log row, like the Excel Log sheet: Date, Ref/PRQ No., Description, Code, Amount, Remarks */
+  let date = String(opts.date || '').trim();
+  if (date && !/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error('Date must be in YYYY-MM-DD format');
+  if (!date) date = new Date().toISOString().slice(0, 10);
+  const ref = String(opts.ref || '').trim().slice(0, 60) || 'MANUAL';
+  const remarks = [String(opts.remarks || '').trim().slice(0, 200), 'Entered by ' + who].filter(Boolean).join(' — ');
   try {
     return addLedgerEntry(deptId, {
-      code, date: new Date().toISOString().slice(0, 10), ref: 'MANUAL',
-      description: description || 'Manual adjustment', amount: Number(amount),
-      remarks: 'Entered by ' + who, source: 'manual',
+      code, date, ref,
+      description: description || 'Manual entry', amount: Number(amount),
+      remarks, source: 'manual',
     });
   } catch (e) {
     if (/UNIQUE constraint failed: budget_ledger.import_key/.test(e.message)) {

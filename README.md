@@ -272,8 +272,9 @@ tab is instant and can never fail because someone has the spreadsheet open.
   line picker by category.
 - **Budget Supervisors can maintain the database** for departments they have
   access to: import a workbook, edit a line's budget/adjustment/description,
-  and post manual spend corrections. Editing figures never touches recorded
-  spend. Identical same-day manual entries are refused rather than duplicated.
+  and add log entries — a full row like the Log sheet, with date, reference
+  (PRQ / invoice no.), description, amount and remarks — which deduct from the
+  line immediately. Editing figures never touches recorded spend. Identical same-day manual entries are refused rather than duplicated.
 - **Spend log:** the Log button on any line opens its full history — imported
   rows, finalized payments (linked to the request), and manual entries.
 - **Export to Excel:** any department can be exported at any time as a

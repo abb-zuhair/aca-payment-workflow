@@ -745,6 +745,17 @@ UT=$(req ahmed "$B/budget/lines?dept=$DEPT_DB" | pyget "print([l['utilized'] for
 python3 -c "assert abs(float('$AVS3') - (9999 + 100 - float('$UT'))) < 0.001, 'available should be budget+adjust-utilized'"
 check "$?" "0" "editing figures leaves recorded spend intact (available = 9999 + 100 − utilized)"
 
+echo "== Log entry with reference and date deducts from the line =="
+AVR=$(req ahmed "$B/budget/lines?dept=$DEPT_DB" | pyget "print([l['available'] for l in d['lines'] if l['code']=='ACAH-CON-04'][0])")
+req ahmed -X POST $B/budget/departments/$DEPT_DB/ledger -H 'Content-Type: application/json' -d '{"code":"ACAH-CON-04","amount":120,"description":"Printer toner - Vendor X","ref":"INV-2026-0451","date":"2026-09-15","remarks":"Paid by cheque"}' > /dev/null
+AVR2=$(req ahmed "$B/budget/lines?dept=$DEPT_DB" | pyget "print([l['available'] for l in d['lines'] if l['code']=='ACAH-CON-04'][0])")
+python3 -c "assert abs((float('$AVR') - float('$AVR2')) - 120) < 0.001"
+check "$?" "0" "log entry deducts 120 from the line"
+E=$(req ahmed "$B/budget/departments/$DEPT_DB/ledger?code=ACAH-CON-04" | pyget "e=[x for x in d['entries'] if x['ref']=='INV-2026-0451'][0]; print(e['entry_date'], e['amount'], 'cheque' in e['remarks'].lower())")
+check "$E" "2026-09-15 120 True" "entry stores the reference, date and remarks"
+R=$(req ahmed -X POST $B/budget/departments/$DEPT_DB/ledger -H 'Content-Type: application/json' -d '{"code":"ACAH-CON-04","amount":5,"date":"15/09/2026"}')
+check "$(echo $R | pyget "print('YYYY-MM-DD' in d.get('error',''))")" "True" "bad date format rejected"
+
 echo "== Identical same-day manual entry is refused (not silently duplicated) =="
 R=$(req ahmed -X POST $B/budget/departments/$DEPT_DB/ledger -H 'Content-Type: application/json' -d '{"code":"ACAH-CON-03","amount":25,"description":"Supervisor correction"}')
 check "$(echo $R | pyget "print('already exists' in d.get('error',''))")" "True" "duplicate manual entry rejected with a clear message"

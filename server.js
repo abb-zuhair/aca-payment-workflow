@@ -958,11 +958,11 @@ app.post('/api/budget/departments/:id/ledger', requireRole('admin', 'budget'), (
     if (!dept) return res.status(404).json({ error: 'Department not found' });
     if (!canManageDept(req, dept)) return res.status(403).json({ error: 'No access to that department' });
     if (dept.mode !== 'db') return res.status(400).json({ error: 'Manual entries are only for database-backed departments' });
-    const { code, amount, description } = req.body || {};
+    const { code, amount, description, ref, date, remarks } = req.body || {};
     const amt = Number(amount);
     if (!code || !isFinite(amt) || amt === 0) return res.status(400).json({ error: 'A budget line code and a non-zero amount are required' });
-    budget.addManualLedgerEntry(dept.id, String(code).trim(), amt, String(description || '').slice(0, 200), req.session.user.name);
-    audit(null, req.session.user.name, `Manual budget entry on ${dept.name} / ${code}: ${amt}`);
+    budget.addManualLedgerEntry(dept.id, String(code).trim(), amt, String(description || '').slice(0, 200), req.session.user.name, { ref, date, remarks });
+    audit(null, req.session.user.name, `Log entry on ${dept.name} / ${code}: ${amt}` + (ref ? ` (ref ${String(ref).slice(0, 60)})` : ''));
     res.json({ ok: true });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });

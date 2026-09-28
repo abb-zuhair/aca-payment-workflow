@@ -702,11 +702,18 @@ function deptToolsHtml(depts, categories) {
         <button class="btn outline" id="bt_import_btn" style="margin-top:8px;">Import Excel</button>
         <span id="bt_import_status" style="font-size:12.5px;margin-left:8px;"></span>
       </div>
-      <div class="field"><label>Manual spend entry</label>
+      <div class="field"><label>Add a log entry (deducts from the line, like a row in the Log sheet)</label>
         <select id="bt_manual_dept" style="width:100%;padding:9px;border:1px solid var(--line);border-radius:7px;background:#fff;margin-bottom:6px;">${dbDepts.map(d => `<option value="${esc(d.id)}">${esc(d.name)}</option>`).join('')}</select>
+        <div style="display:flex;gap:6px;margin-bottom:6px;">
+          <input id="bt_manual_date" type="date" value="${new Date().toISOString().slice(0, 10)}" title="Date" style="flex:1;">
+          <input id="bt_manual_ref" placeholder="Ref / PRQ / invoice no." title="Reference" style="flex:1.4;">
+        </div>
         <input id="bt_manual_code" placeholder="Budget code (e.g. ACAH-CON-02)" style="margin-bottom:6px;">
-        <input id="bt_manual_amount" type="number" step="0.001" placeholder="Amount (negative = refund)" style="margin-bottom:6px;">
-        <input id="bt_manual_desc" placeholder="Description" style="margin-bottom:6px;">
+        <input id="bt_manual_desc" placeholder="Description / vendor" style="margin-bottom:6px;">
+        <div style="display:flex;gap:6px;margin-bottom:6px;">
+          <input id="bt_manual_amount" type="number" step="0.001" placeholder="Amount (negative = refund)" style="flex:1;">
+          <input id="bt_manual_remarks" placeholder="Remarks (optional)" style="flex:1.4;">
+        </div>
         <button class="btn outline" id="bt_manual_btn">Post entry</button>
         <span id="bt_manual_status" style="font-size:12.5px;margin-left:8px;"></span>
       </div>
@@ -736,6 +743,9 @@ function bindDeptTools(depts) {
         code: document.getElementById('bt_manual_code').value.trim(),
         amount: Number(document.getElementById('bt_manual_amount').value),
         description: document.getElementById('bt_manual_desc').value,
+        ref: document.getElementById('bt_manual_ref').value,
+        date: document.getElementById('bt_manual_date').value,
+        remarks: document.getElementById('bt_manual_remarks').value,
       }) });
       st.style.color = 'var(--green)'; st.textContent = '✓ Posted'; setTimeout(() => render(), 900);
     } catch (e) { st.style.color = 'var(--red)'; st.textContent = e.message; }
